@@ -23,6 +23,7 @@ insightface==2.0              # pretrained packs are research / non-commercial
 onnxruntime==1.30.0
 transformers==5.17.0
 opencv-python==5.0.0.93
+scikit-image==0.26.0         # marching cubes for the 3-D mesh (recon.py)
 
 # tests
 pytest==9.1.1

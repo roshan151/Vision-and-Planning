@@ -20,13 +20,20 @@ error shape); state lives on app.state, built in app.lifespan.
     POST   /v1/slam/save           save the map (also done after every keyframe)
     GET    /v1/slam/state
     GET    /v1/slam/map.png        the map, with plants marked
+
+    POST   /v1/recon/frame         one scan frame + where it was taken -> stored for the 3-D mesh
+    POST   /v1/recon/build         fuse the map's frames into a 3-D mesh (TSDF, recon.py), in the background
+    GET    /v1/recon/status        the build's progress and report
+    GET    /v1/recon/mesh.ply      the coloured mesh
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -36,8 +43,9 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from . import images, photos
+from . import images, photos, recon
 from .plants import BadLabel, check_label
+from .runner import Busy
 from .settings import settings
 from .vlm import VLMUnavailable
 
@@ -252,7 +260,8 @@ class ViewpointsIn(BaseModel):
 
 class ResetIn(BaseModel):
     name: Optional[str] = None
-    initial_pose: list[float] = Field([0.0, 0.0, 0.0], min_length=3, max_length=3)
+    initial_pose: list[float] = Field([0.0, 0.0, 0.0], min_length=3, max_length=3,
+                                     description="where the robot stands on the map at the first keyframe")
     load: bool = Field(False, description="continue on the saved map `name`")
     explore_radius_m: Optional[float] = Field(None, description="only explore within this radius of initial_pose; null/0 = unlimited")
     no_behind: bool = Field(False, description="only explore ahead of initial_pose's heading")
@@ -279,6 +288,7 @@ def _save_map(st) -> str:
     and maps/<name>.png (plants marked, with their height)."""
     path = st.slam.save(settings.slam_dir)
     path.with_suffix(".png").write_bytes(st.slam.render(2, st.plants.positions()))
+    _recon(st).save_keyframes(list(st.slam.keyframes))      # the mesh follows loop closures too
     return str(path)
 
 
@@ -319,7 +329,9 @@ async def slam_reset(request: Request, body: ResetIn) -> dict:
             raise HTTPException(status_code=404, detail=f"no saved map {s.name!r}") from exc
     s.reset(body.initial_pose, keep_map=body.load, radius_m=body.explore_radius_m, no_behind=body.no_behind)
     # Plant photos are filed under plants/map_{index}/: a new map starts a new index.
-    return {**s.state(), "map_index": request.app.state.plants.use_map(s.name, new=not body.load)}
+    index = request.app.state.plants.use_map(s.name, new=not body.load)
+    _recon(request.app.state).start(s.name, index)          # scan frames for the 3-D mesh, per run
+    return {**s.state(), "map_index": index}
 
 
 @router.post("/v1/slam/save", tags=["slam"])
@@ -337,3 +349,99 @@ async def slam_map(request: Request, scale: int = 2) -> Response:
     st = request.app.state
     png = await run_in_threadpool(st.slam.render, max(1, min(scale, 8)), st.plants.positions())
     return Response(png, media_type="image/png")
+
+
+# --------------------------------------------------------------------------
+# 3-D reconstruction (recon.py)
+# --------------------------------------------------------------------------
+
+def _recon(st) -> recon.ReconStore:
+    if getattr(st, "recon", None) is None:
+        st.recon = recon.ReconStore(settings.slam_dir / "recon")
+        st.recon_job = {"state": "idle"}
+    return st.recon
+
+
+class ReconBuildIn(BaseModel):
+    name: Optional[str] = Field(None, description="map name; default: the current one")
+    voxel_m: float = Field(0.03, ge=0.01, le=0.2)
+    trunc_m: float = Field(0.10, ge=0.02, le=0.5)
+
+
+@router.post("/v1/recon/frame", tags=["recon"])
+async def recon_frame(request: Request, image: UploadFile = File(...), meta: str = Form(...)) -> dict:
+    """A scan frame from explore, filed under the keyframe it is taken for (the next one posted)."""
+    st = request.app.state
+    try:
+        m = json.loads(meta)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="meta is not JSON") from exc
+    if not isinstance(m, dict) or len(m.get("odom") or []) != 3 or "pan_deg" not in m or "tilt_deg" not in m:
+        raise HTTPException(status_code=422, detail="meta needs odom [x, y, theta], pan_deg and tilt_deg")
+    kf_id = len(st.slam.keyframes)
+    path = await run_in_threadpool(_recon(st).add_frame, await image.read(), m, kf_id, st.slam.name)
+    return {"saved": path, "kf_id": kf_id}
+
+
+@router.post("/v1/recon/build", tags=["recon"])
+async def recon_build(request: Request, body: Optional[ReconBuildIn] = None) -> dict:
+    st = request.app.state
+    body = body or ReconBuildIn()
+    store = _recon(st)
+    if st.recon_job.get("state") == "running":
+        raise HTTPException(status_code=409, detail="a build is already running")
+    name = body.name or st.slam.name
+    runs = store.runs(name)
+    if not runs:
+        raise HTTPException(status_code=404, detail=f"no scan frames for map {name!r}")
+    st.recon_job = {"state": "running", "name": name, "runs": [p.name for p in runs], "done": 0, "total": None}
+    st.recon_task = asyncio.create_task(_build(st, runs, recon.TsdfConfig(voxel_m=body.voxel_m, trunc_m=body.trunc_m)))
+    return st.recon_job
+
+
+async def _build(st, runs, cfg) -> None:
+    """The steps of recon.reconstruct, with the depth model run through the GPU queue so a build
+    never pushes in front of the robot's own requests, and the CPU work off the event loop."""
+    job, store, t0 = st.recon_job, st.recon, time.monotonic()
+    try:
+        calib = recon.load_calib(store.root)
+        frames, skipped = await run_in_threadpool(recon.load_frames, runs)
+        rec = await run_in_threadpool(recon.Reconstruction, frames, cfg, calib)
+        rec.report["skipped"].update(skipped)
+        job["total"] = len(rec.frames)
+        for fr in rec.frames:
+            rgb = await run_in_threadpool(recon.decode_rgb, fr, calib)
+            while True:
+                try:
+                    rel, _ = await st.runner.run(st.backend.depth.depth_map, rgb)
+                    break
+                except Busy:
+                    await asyncio.sleep(0.5)
+            await run_in_threadpool(rec.add, fr, rgb, rel)
+            job["done"] += 1
+        out = store.root / f"{runs[0].name.rsplit('-', 2)[0]}.ply"
+        rep = await run_in_threadpool(rec.finish, out)
+        rep["runs"], rep["seconds"] = [p.name for p in runs], round(time.monotonic() - t0, 1)
+        out.with_suffix(".json").write_text(json.dumps(rep, indent=1))
+        job.update(state="done", mesh=str(out), report={k: v for k, v in rep.items() if k != "per_frame"})
+    except Exception as exc:                                  # noqa: BLE001 — reported in the job
+        log.exception("recon build failed")
+        job.update(state="failed", error=f"{type(exc).__name__}: {exc}")
+
+
+@router.get("/v1/recon/status", tags=["recon"])
+async def recon_status(request: Request) -> dict:
+    _recon(request.app.state)
+    return request.app.state.recon_job
+
+
+@router.get("/v1/recon/mesh.ply", tags=["recon"])
+async def recon_mesh(request: Request) -> FileResponse:
+    st = request.app.state
+    mesh = (getattr(st, "recon_job", None) or {}).get("mesh")
+    if not mesh or not Path(mesh).exists():
+        built = sorted(_recon(st).root.glob(f"{st.slam.name}-m*.ply"), key=lambda p: p.stat().st_mtime)
+        if not built:
+            raise HTTPException(status_code=404, detail="no mesh built yet: POST /v1/recon/build")
+        mesh = str(built[-1])
+    return FileResponse(mesh, media_type="application/octet-stream", filename=Path(mesh).name)

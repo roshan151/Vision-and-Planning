@@ -632,8 +632,10 @@ class SlamSession:
 
     def reset(self, initial_pose: Sequence[float] = (0.0, 0.0, 0.0), keep_map: bool = False,
               radius_m: Optional[float] = None, no_behind: bool = False) -> None:
-        """Start a new run. With keep_map (after `load`), the robot is told
-        where it is on the saved map — the "user points at the start" case."""
+        """Start a new run. `initial_pose` is where the robot stands on the map at the run's first
+        keyframe (any odometry reading: later keyframes follow from the odometry since then). With
+        keep_map (after `load`), the robot is told where it is on the saved map — the "user points
+        at the start" case."""
         with self.lock:
             if not keep_map:
                 self.grid = OccupancyGrid(self.config.size_m, self.config.res)
@@ -675,7 +677,10 @@ class SlamSession:
                 last = self.keyframes[-1]
                 prior = compose(last.pose, between(last.odom, odom))
             else:
-                prior = compose(self.initial_pose, odom)
+                # The first keyframe is taken where the run starts, so it IS initial_pose, whatever the
+                # odometry reads: odometry is not reset between tasks (Nov 21: explore after a follow
+                # started at odom (-9.2, -7.5), 11.9 m from the start, outside its 10 m radius: "done").
+                prior = tuple(self.initial_pose)
             loop = self._close_loop(prior, pts[hit])
             if loop:
                 m = MatchResult(tuple(loop.pop("pose")), loop["score"], True)

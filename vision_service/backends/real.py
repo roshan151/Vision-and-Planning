@@ -163,6 +163,16 @@ class DepthAnythingEstimator:
         self.model_version = model_id.split("/")[-1]
         log.info("depth estimator ready: %s on %s (relative, not metric)", model_id, device)
 
+    def depth_map(self, image: np.ndarray) -> np.ndarray:
+        """The whole relative inverse-depth map (bigger = nearer) at the model's resolution, for
+        the 3-D reconstruction (recon.py), which scales it to metres with the ToF."""
+        from PIL import Image
+
+        out = self._pipe(Image.fromarray(image))
+        d = np.asarray(out["predicted_depth"] if "predicted_depth" in out else out["depth"],
+                       dtype=np.float32)
+        return d[0] if d.ndim == 3 else d
+
     def depth_at(
         self, image: np.ndarray, points: Sequence[tuple[float, float]]
     ) -> tuple[list[float], list[float]]:
