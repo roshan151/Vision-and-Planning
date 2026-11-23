@@ -6,8 +6,10 @@ from, the head's pan and tilt, the robot's pitch, the head geometry, and the 8x8
 it. Afterwards (POST /v1/recon/build, or `python -m vision_service.recon home`) every frame:
 
   1. gets its camera pose in the map:  map <- keyframe pose (the SLAM's, after loop closure)
-     <- odometry since that keyframe <- pitch <- head mount <- pan <- tilt (+ the head's tilt offset)
-     <- camera axes. Roll is taken as level: the robot is standing still on the floor;
+     <- odometry since that keyframe <- pitch <- head mount <- pan <- tilt <- camera axes. The tilt
+     the robot sends is the REAL one, degrees above level: it already includes the head's tilt
+     offset (geom tilt_offset_deg, sent for the record only), as follow and the nav stream do.
+     Roll is taken as level: the robot is standing still on the floor;
   2. gets a depth for every pixel: Depth Anything gives relative inverse depth d (right up to
      1/z = a*d + b, a and b unknown per frame). The ToF zones that land in the picture give true
      depths; a and b are fitted to them (RANSAC, then least squares on the inliers). A frame whose
@@ -119,10 +121,11 @@ def _between(a, b) -> tuple:
 
 def camera_pose(base: Sequence[float], pitch_deg: Optional[float], pan_deg: float, tilt_deg: float,
                 geom: dict) -> tuple:
-    """(R, t): camera axes and position in the map. The same chain as Head.project: tilt (plus the
-    head's tilt offset: how far up it really looks at tilt 0), then pan, then the robot's pitch."""
+    """(R, t): camera axes and position in the map. The same chain as Head.project: tilt, then pan,
+    then the robot's pitch. `tilt_deg` is the REAL tilt (degrees above level, the head's tilt offset
+    already in it); geom["tilt_offset_deg"] is not added again."""
     R_base = _rz(base[2]) @ _ry(-math.radians(pitch_deg or 0.0))           # pitch > 0: nose up
-    R_head = _rz(math.radians(pan_deg)) @ _ry(-math.radians(tilt_deg + geom.get("tilt_offset_deg", 0.0)))
+    R_head = _rz(math.radians(pan_deg)) @ _ry(-math.radians(tilt_deg))
     mount = np.array([geom.get("pan_axis_x_m", 0.0), geom.get("pan_axis_y_m", 0.0), geom.get("height_m", 0.22)])
     return R_base @ R_head @ R_OPT, np.array([base[0], base[1], 0.0]) + R_base @ mount
 
