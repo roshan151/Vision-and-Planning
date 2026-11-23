@@ -76,7 +76,7 @@ def distance_field(occ: np.ndarray, res: float, cap_m: float = 1.0) -> np.ndarra
 
 
 def _los(free: np.ndarray, a, b) -> bool:
-    n = max(abs(b[0] - a[0]), abs(b[1] - a[1])) * 2 + 1
+    n = int(max(abs(b[0] - a[0]), abs(b[1] - a[1])) * 2) + 1   # int(): door_approach's points are fractional cells
     xs = np.rint(np.linspace(a[0], b[0], n)).astype(int)
     ys = np.rint(np.linspace(a[1], b[1], n)).astype(int)
     return bool(free[xs, ys].all())
@@ -115,6 +115,90 @@ def theta_star(free: np.ndarray, start, goal, penalty: Optional[np.ndarray] = No
                 g[n], parent[n] = cost, via
                 heapq.heappush(todo, (cost + math.dist(n, goal), n))
     return None
+
+
+DOOR_NARROW_M = 0.20     # a gap narrower than 2 x (radius + this) across is a doorway (1.03 m at the Pi's radius:
+                         # a 36" door, 0.91 m, with its frame blurred by the ToF's 7.5 deg zones)
+DOOR_APPROACH_M = 0.45   # come in on the gap's axis from this far before its middle...
+DOOR_EXIT_M = 0.30       # ...and leave along it to this far past
+DOOR_REACH_M = 1.0       # how far either way to look for a gap's sides
+
+
+def _cross(occ: np.ndarray, c, res: float):
+    """(width m, angle rad, middle (fx, fy) in cells) of the narrowest cross-section through cell c that has
+    an occupied cell on both sides within DOOR_REACH_M; None if every line through c is open on a side."""
+    best, reach = None, int(DOOR_REACH_M / res)
+    for deg in range(0, 180, 6):
+        a = math.radians(deg)
+        dx, dy = math.cos(a), math.sin(a)
+        ends = []
+        for sgn in (1, -1):
+            k, hit = 0, False
+            while k < reach:
+                x, y = int(round(c[0] + sgn * dx * (k + 1))), int(round(c[1] + sgn * dy * (k + 1)))
+                if not (0 <= x < occ.shape[0] and 0 <= y < occ.shape[1]):
+                    break                                    # off the window: not known to be closed
+                if occ[x, y]:
+                    hit = True
+                    break
+                k += 1
+            ends.append(k if hit else None)
+        if None in ends:
+            continue
+        w = (ends[0] + ends[1] + 1) * res
+        if best is None or w < best[0]:
+            mid = (ends[0] - ends[1]) / 2.0
+            best = (w, a, (c[0] + dx * mid, c[1] + dy * mid))
+    return best
+
+
+def door_approach(cells: list, occ: np.ndarray, field: np.ndarray, free: np.ndarray, radius_m: float,
+                  res: float) -> Tuple[list, Optional[dict]]:
+    """The first narrow gap the path goes through (a door, a gap between furniture), entered on its axis:
+    an approach point DOOR_APPROACH_M before its middle, the middle, a point DOOR_EXIT_M past it. The robot
+    then turns in the open and crosses straight; Nov 22 it arrived at gaps at an angle and stalled in them
+    four times, pivoting and backing off with 1-11 cm to spare. Returns (cells, what it did or None); the
+    path is unchanged when the robot is already at the gap, the goal is in it, or a leg would not be free."""
+    if len(cells) < 2:
+        return cells, None
+    lim = 2.0 * (radius_m + DOOR_NARROW_M)
+    samples = []                                             # (leg index, (fx, fy)) every cell along the path
+    for i, (a, b) in enumerate(zip(cells, cells[1:])):
+        n = max(1, int(math.ceil(math.dist(a, b))))
+        samples += [(i, (a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n)) for k in range(n)]
+    stretch = []                                             # the first run of narrow samples: (sample #, cross)
+    for j, (_, q) in enumerate(samples):
+        c = (int(round(q[0])), int(round(q[1])))
+        cr = _cross(occ, c, res) if field[c] < radius_m + DOOR_NARROW_M else None
+        if cr is not None and cr[0] < lim:
+            stretch.append((j, cr))
+        elif stretch:
+            break
+    if not stretch or stretch[-1][0] >= len(samples) - 1:
+        return cells, None                                   # no gap, or the goal is in it
+    j, (w, ang, mid) = min(stretch, key=lambda s: s[1][0])
+    leg = samples[j][0]
+    u = np.array([-math.sin(ang), math.cos(ang)])            # along the gap's axis...
+    tang = np.subtract(cells[leg + 1], cells[leg])
+    if float(u @ tang) < 0:
+        u = -u                                               # ...the way the path crosses it
+    m = np.array(mid)
+    along = lambda pt: float((np.asarray(pt, float) - m) @ u) * res
+    if along(cells[0]) > -(DOOR_APPROACH_M - 0.1):
+        return cells, None                                   # already at the gap: too late to line up
+    # Not rounded to whole cells: in a 0.8 m door there are ~8 cm to spare, and rounding cost 5-8 cm of it.
+    new_pts = [(float(p[0]), float(p[1])) for p in (m - u * DOOR_APPROACH_M / res, m, m + u * DOOR_EXIT_M / res)]
+    before = list(cells[:leg + 1])
+    while len(before) > 1 and along(before[-1]) > -DOOR_APPROACH_M + 0.05:
+        before.pop()                                         # turning points inside the approach: replaced
+    after = list(cells[samples[stretch[-1][0]][0] + 1:])     # the legs after the one the gap ends on
+    while len(after) > 1 and along(after[0]) < DOOR_EXIT_M - 0.05:
+        after.pop(0)                                         # ...and inside the exit
+    out = before + new_pts + after
+    if not all(0 <= c[0] <= free.shape[0] - 1 and 0 <= c[1] <= free.shape[1] - 1 for c in new_pts) or \
+            not all(_los(free, a, b) for a, b in zip(out, out[1:]) if a != b):
+        return cells, None
+    return out, {"width_m": round(w, 2), "middle_cell": [round(float(m[0]), 1), round(float(m[1]), 1)]}
 
 
 class GlobalMap:
@@ -240,7 +324,13 @@ class GlobalMap:
                 if goal_c is None:
                     continue
             cells = theta_star(free, ls, goal_c, penalty)
+            self.last_door = None
             if cells:
+                cells, door = door_approach(cells, occ, field, free, radius_m, self.res)
+                if door is not None:
+                    c = door.pop("middle_cell")
+                    door["middle"] = [round(v, 3) for v in self.centre((c[0] + x0, c[1] + y0))]
+                    self.last_door = door
                 path = [start] + [self.centre((c[0] + x0, c[1] + y0)) for c in cells[1:]]
                 if goal_c == lg:
                     path[-1] = tuple(goal)

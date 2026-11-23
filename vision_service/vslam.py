@@ -39,6 +39,7 @@ import json
 import logging
 import math
 import os
+import signal
 import threading
 import time
 from collections import OrderedDict, deque
@@ -365,8 +366,7 @@ class MonoVSLAM:
             self.vocab = vocab
             self.backend = "orbslam3"
         else:
-            self.backend = "pyvo"
-            self.reason = "using PyMonoVO fallback"
+            self.reason = "ORB-SLAM3 not installed (orbslam3 module or vocabulary missing): odometry only"
         threading.Thread(target=self._work, name="vslam", daemon=True).start()
 
     # ---------------------------------------------------------------- input
@@ -431,19 +431,15 @@ class MonoVSLAM:
                 self._track(*item)
             except Exception as exc:                       # noqa: BLE001
                 log.warning("vslam: %s: %s", type(exc).__name__, exc)
-                if self.backend == "orbslam3" and ("process exited" in str(exc) or "did not start" in str(exc)):
-                    log.info("vslam: falling back to PyMonoVO")
-                    self.backend = "pyvo"
-                    self.reason = f"ORB-SLAM3 stopped: {exc}; using PyMonoVO fallback"
-                    self._sys = PyMonoVO(self.hfov)
-                    self.record("slam_fallback", reason=str(exc))
+                if self.backend != "orbslam3":
                     continue
-                elif self.backend != "orbslam3":
-                    continue
-                else:
-                    self.backend, self.reason, self.tracking = "none", f"SLAM stopped: {exc}", False
-                    self.record("slam_stopped", reason=str(exc))
-                    return
+                # Odometry alone from here, with the last correction kept: it goes stale slowly. PyMonoVO used to take
+                # over here, and on Nov 22 (ORB-SLAM3 died 112 s into a follow) its correction moved the map up to
+                # 19.5 m and spun it round; 58 of the next 238 plans failed against walls that were not there.
+                self.backend, self.tracking, self._sys = "none", False, None
+                self.reason = f"ORB-SLAM3 stopped: {exc}; odometry only (last correction kept)"
+                self.record("slam_stopped", reason=str(exc))
+                return
 
     def _start(self, w: int, h: int) -> None:
         if self.backend == "orbslam3":
@@ -464,13 +460,9 @@ class MonoVSLAM:
                 self._sys = sys_
                 log.info("vslam: ORB-SLAM3 monocular started (%dx%d, hfov %.0f)", w, h, self.hfov)
             except Exception as exc:
-                log.warning("vslam: ORB-SLAM3 start failed (%s); falling back to PyMonoVO", exc)
-                self.backend = "pyvo"
-                self.reason = f"ORB-SLAM3 start failed: {exc}; using PyMonoVO fallback"
-                self._sys = PyMonoVO(self.hfov)
-        elif self.backend == "pyvo":
-            self._sys = PyMonoVO(self.hfov)
-            log.info("vslam: PyMonoVO monocular started (%dx%d, hfov %.0f)", w, h, self.hfov)
+                log.warning("vslam: ORB-SLAM3 start failed (%s); odometry only", exc)
+                self.backend, self.reason = "none", f"ORB-SLAM3 start failed: {exc}; odometry only"
+                self.record("slam_stopped", reason=str(exc))
 
     def _track(self, jpeg: bytes, t: float, odom, pan: float, tilt: float, tof: Optional[dict] = None) -> None:
         from PIL import Image
@@ -488,6 +480,8 @@ class MonoVSLAM:
         if self._sys is None:
             self._start(*size)
             self._size = size
+            if self._sys is None:                          # it did not start: odometry only (self.reason says why)
+                return
         if t == WARM_T:                                    # the warm-up frame: loaded, nothing to track or record
             self._sys.process_image_mono(img, t)
             log.info("vslam: %s ready (warm-up frame %dx%d)", self.backend, *size)
@@ -624,15 +618,24 @@ def _plain(v):
 
 def _orb_child(conn, vocab: str, cfg: str) -> None:
     """The ORB-SLAM3 process: builds the System, then answers calls on it until told to stop."""
+    import faulthandler
+    faulthandler.enable()                  # a native crash prints the signal and the call it died in (Nov 22: it died silently)
+    t0 = time.monotonic()
+
+    def say(what: str) -> None:            # this process has no logging set up: plain lines in the service log
+        print(f"vslam child: {what} at +{time.monotonic() - t0:.1f} s", flush=True)
     try:
         import orbslam3
+        say("orbslam3 imported")
         try:
             sys_ = orbslam3.System(vocab, cfg, orbslam3.Sensor.MONOCULAR, False)
         except TypeError:
             sys_ = orbslam3.System(vocab, cfg, orbslam3.Sensor.MONOCULAR)
             if hasattr(sys_, "set_use_viewer"):
                 sys_.set_use_viewer(False)
-        sys_.initialize()
+        say("System constructed")
+        sys_.initialize()                  # the vocabulary loads here (hello-binit bindings)
+        say(f"initialized ({Path(vocab).name})")
         conn.send(("ready", None))
     except Exception as exc:                               # noqa: BLE001
         import traceback
@@ -690,7 +693,10 @@ class _OrbProcess:
                 self._conn.send((name, args))
                 kind, value = self._conn.recv()
             except (EOFError, OSError, BrokenPipeError) as exc:
-                raise RuntimeError(f"ORB-SLAM3 process exited (code {self._proc.exitcode})") from exc
+                self._proc.join(timeout=2.0)       # reap it: exitcode is None until then (Nov 22: "code None")
+                code = self._proc.exitcode
+                why = f" = {signal.Signals(-code).name}" if code is not None and code < 0 else ""
+                raise RuntimeError(f"ORB-SLAM3 process exited (code {code}{why})") from exc
         if kind == "err":
             raise RuntimeError(value)
         return value

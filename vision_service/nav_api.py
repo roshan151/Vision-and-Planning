@@ -157,7 +157,8 @@ async def nav_plan(request: Request, body: PlanIn) -> dict:
                start_map=list(start), goal_map=[float(goal[0]), float(goal[1])], folded_cells=folded,
                target=body.target, target_map=None if target is None else [float(target[0]), float(target[1])],
                path_map=path or [], path_odom=apply(inverse(o2m), path).tolist() if path else [],
-               margin_m=getattr(nav.map, "last_margin", None), ms=nav.last_plan_ms, ok=bool(path),
+               margin_m=getattr(nav.map, "last_margin", None), door=getattr(nav.map, "last_door", None),
+               ms=nav.last_plan_ms, ok=bool(path),
                vslam_tracking=nav.vslam.tracking, map=map_file)
     if not path:
         nav.failed += 1
