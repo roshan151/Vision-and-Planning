@@ -117,6 +117,7 @@ def theta_star(free: np.ndarray, start, goal, penalty: Optional[np.ndarray] = No
     return None
 
 
+DETOUR_M = 0.5          # a narrower-margin path is taken when it is at least this much shorter than the roomy one
 DOOR_NARROW_M = 0.20     # a gap narrower than 2 x (radius + this) across is a doorway (1.03 m at the Pi's radius:
                          # a 36" door, 0.91 m, with its frame blurred by the ToF's 7.5 deg zones)
 DOOR_APPROACH_M = 0.45   # come in on the gap's axis from this far before its middle...
@@ -294,8 +295,11 @@ class GlobalMap:
             far = np.hypot(xs - b[0], ys - b[1]) > rb
             return not bool(occ[xs[far], ys[far]].any())
         penalty = np.clip((radius_m + 0.4 - field) / 0.4, 0.0, 1.0) * 2.0 + unknown * 0.3
-        for margin in (margin_m, 0.03):
-            self.last_margin = margin
+        # The roomy margin first; if that path is the long way round, narrower ones too (down to 0: the Pi's
+        # radius_m already holds DWA's radius + margin + PLAN_EXTRA_M), and the shorter way wins by DETOUR_M.
+        # Nov 23: a 0.5-0.6 m gap DWA could drive (it needs 0.43 m) was planned 5-9 m round, or not at all.
+        best = None
+        for margin in (margin_m, 0.03, 0.0):
             free = field >= radius_m + margin
             strict = free.copy()                               # where it may END: never the relaxed area below
             if not free[ls]:                                   # starting in the margin: may leave it, but only
@@ -324,20 +328,26 @@ class GlobalMap:
                 if goal_c is None:
                     continue
             cells = theta_star(free, ls, goal_c, penalty)
-            self.last_door = None
-            if cells:
-                cells, door = door_approach(cells, occ, field, free, radius_m, self.res)
-                if door is not None:
-                    c = door.pop("middle_cell")
-                    door["middle"] = [round(v, 3) for v in self.centre((c[0] + x0, c[1] + y0))]
-                    self.last_door = door
-                path = [start] + [self.centre((c[0] + x0, c[1] + y0)) for c in cells[1:]]
-                if goal_c == lg:
-                    path[-1] = tuple(goal)
-                self.last_path = path
-                return path
-        self.last_path = []
-        return None
+            if not cells:
+                continue
+            cells, door = door_approach(cells, occ, field, free, radius_m, self.res)
+            if door is not None:
+                c = door.pop("middle_cell")
+                door["middle"] = [round(v, 3) for v in self.centre((c[0] + x0, c[1] + y0))]
+            path = [start] + [self.centre((c[0] + x0, c[1] + y0)) for c in cells[1:]]
+            if goal_c == lg:
+                path[-1] = tuple(goal)
+            length = sum(math.dist(a, b) for a, b in zip(path, path[1:]))
+            if best is None or length < best[0] - DETOUR_M:
+                best = (length, path, door, margin)
+            if length <= math.dist(start, path[-1]) * 1.3 + 0.3:    # no long way round: keep the most room
+                break
+        if best is None:
+            self.last_path, self.last_door = [], None
+            return None
+        _, path, self.last_door, self.last_margin = best
+        self.last_path = path
+        return path
 
     def stats(self) -> dict:
         with self._lock:
