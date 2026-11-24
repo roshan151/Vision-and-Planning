@@ -1,7 +1,8 @@
 # Vision service: install, test and run it on the Mac mini.
 #
 #   make help      list every target
-#   make deploy    after any code change: install deps if needed, test, restart
+#   make deploy    after any code change: install deps if needed, check, restart
+#   make test      exercise every endpoint of the RUNNING service, ORB-SLAM3 included
 #
 # Everything here is plain launchd + a Python venv. See README.md, "Deploying".
 
@@ -30,7 +31,7 @@ HEALTH_TIMEOUT ?= 180
 # ORB-SLAM3 loads its vocabulary after the service is up (vslam._OrbProcess gives it 300 s).
 VSLAM_TIMEOUT  ?= 330
 
-.PHONY: help install reinstall test run deploy start restart stop uninstall \
+.PHONY: help install reinstall check test run deploy start restart stop uninstall \
         status health logs wait-healthy wait-vslam clean FORCE
 
 help: ## Show this list
@@ -58,16 +59,20 @@ reinstall: ## Delete .venv and install everything from scratch
 	rm -rf $(VENV)
 	@$(MAKE) --no-print-directory install
 
-# The test suite lives in Monitoring-Service now; this only checks the service imports and every
-# router is mounted, so `make deploy` never restarts into a broken app.
-test: $(STAMP) ## Check the app imports and its routes are all there (~2 s, no models loaded)
+# Checks the service imports and every router is mounted, so `make deploy` never restarts into a broken app.
+check: $(STAMP) ## Check the app imports and its routes are all there (~2 s, no models loaded)
 	$(PY) -c "import vision_service.app as a; p = a.app.openapi()['paths']; \
 	missing = [r for r in ('/healthz', '/v1/follow/step', '/v1/nav/plan', '/v1/slam/keyframe', '/v1/debug/frame') if r not in p]; \
 	assert not missing, f'routes missing: {missing}'; print(f'app OK: {len(p)} routes')"
 
 # -------------------------------------------------------------- service ---
 
-deploy: install test start ## Rebuild after a change: install if needed, test, restart, wait until healthy
+# Live: every endpoint of the service as it runs now, ORB-SLAM3 fed a recorded run (vision_service/selftest.py).
+# Resets the follow map and the explore SLAM session (the robot should be idle); removes what it adds.
+test: $(STAMP) ## Test every endpoint of the running service, ORB-SLAM3 included (~1-2 min; make start first)
+	$(PY) -m vision_service.selftest --url http://127.0.0.1:$(VS_PORT)
+
+deploy: install check start ## Rebuild after a change: install if needed, check, restart, wait until healthy
 
 # The installed plist is generated from the template, so its paths always
 # point at this checkout. Re-rendered whenever the template changes, and whenever

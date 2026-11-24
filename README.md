@@ -452,8 +452,8 @@ That runs, in order, stopping at the first failure:
 1. **`make install`**: creates `.venv` and installs `.[models,dev]`. Only does
    work when `pyproject.toml` has changed since the last install, so it's
    instant most of the time.
-2. **`make test`**: the test suite. A failing test stops the deploy, and the
-   old version keeps running.
+2. **`make check`**: the app imports and every route is mounted. A failure stops the
+   deploy, and the old version keeps running.
 3. **`make start`**: stops the running service, starts the new code, then
    waits for `/healthz` to answer (up to 180 s, since the first start
    downloads model weights) and prints it. If it never comes up, it prints
@@ -463,13 +463,14 @@ That runs, in order, stopping at the first failure:
 
 | Command | What it does |
 |---|---|
-| `make deploy` | Install if needed → test → restart → wait until healthy |
+| `make deploy` | Install if needed → check → restart → wait until healthy |
 | `make start` / `make restart` | Restart without reinstalling or testing |
 | `make stop` | Stop it. Stays stopped until `make start` or your next login |
 | `make status` | launchd state (running? pid? crash count?) + `/healthz` |
 | `make logs` | Follow the log. `Ctrl-C` to stop following |
 | `make run` | Run in this terminal instead (for debugging; `make stop` first) |
-| `make test` | Just the tests |
+| `make test` | Test every endpoint of the **running** service, ORB-SLAM3 included (`vision_service/selftest.py`; resets the follow map and explore session, removes what it adds) |
+| `make check` | Just the import / routes check |
 | `make reinstall` | Delete `.venv` and install from scratch |
 | `make uninstall` | Stop it and remove it from launchd entirely |
 | `make help` | List all of the above |
@@ -586,3 +587,7 @@ the first real frame blows the Pi's 0.6 s timeout.
 round trip: the difference is your network, and knowing which half is slow is
 worth more than either number alone. Phase V1 in VISION-DESIGN.md exists
 specifically to measure this before anything is built on top of it.
+
+
+## Test
+cp "$(ls -t ~/Library/Logs/DiagnosticReports/python3*.ips | head -1)" ~/src/Vision-And-Planning/debug/

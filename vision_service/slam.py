@@ -497,9 +497,13 @@ class SlamSession:
         ij = ij[self.grid.inside(ij)]
         layer[ij[:, 1], ij[:, 0]] = True
 
-    def _trav(self, extra: float = 0.0) -> np.ndarray:
+    def _trav(self, extra: float = 0.0, unknown: bool = False) -> np.ndarray:
+        """Where the robot's centre may go. unknown: also floor not seen yet (not only seen free), as
+        long as nothing known is within reach; the Pi probes the floor before every step of such a leg."""
         r = self.config.robot_radius + self.config.clearance + extra
         nogo = _dilate(self.low | self.drops, int(math.ceil(r / self.grid.res)))
+        if unknown:
+            return ~_dilate(self.grid.occupied(), int(math.ceil(r / self.grid.res))) & ~nogo
         return traversable(self.grid, r) & ~nogo
 
     def _plan(self, start_xy, goal_xy) -> Optional[list]:
@@ -508,7 +512,10 @@ class SlamSession:
             p = plan_path(self.grid, self._trav(self.config.pref_clearance), start_xy, goal_xy)
             if p is not None:
                 return p
-        return plan_path(self.grid, self._trav(), start_xy, goal_xy)
+        p = plan_path(self.grid, self._trav(), start_xy, goal_xy)
+        # Last: through floor not seen yet (round the far side of a plant, to one across the room).
+        # Nov 23: every viewpoint but the one on the robot's side was refused, and plants 2 m off got none.
+        return p if p is not None else plan_path(self.grid, self._trav(unknown=True), start_xy, goal_xy)
 
     def clearances(self, path: Sequence, reach: float = 1.0) -> list:
         """For each path point, the nearest mapped wall, low obstacle or drop (m, capped at
@@ -771,7 +778,7 @@ class SlamSession:
         required up to `radius * 0.5` from it.
         """
         with self.lock:
-            trav = self._trav()
+            trav = self._trav(unknown=True)             # the plant's far side is not seen yet: unknown is fine
             occ = self.grid.occupied()
             tx, ty = map(float, target_xy)
             if start_angle is None:

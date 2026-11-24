@@ -117,6 +117,7 @@ def theta_star(free: np.ndarray, start, goal, penalty: Optional[np.ndarray] = No
     return None
 
 
+SEM_PERSON_M = 0.8      # camera-named things this near the person being followed are not planned round
 DETOUR_M = 0.5          # a narrower-margin path is taken when it is at least this much shorter than the roomy one
 DOOR_NARROW_M = 0.20     # a gap narrower than 2 x (radius + this) across is a doorway (1.03 m at the Pi's radius:
                          # a 36" door, 0.91 m, with its frame blurred by the ToF's 7.5 deg zones)
@@ -281,8 +282,17 @@ class GlobalMap:
         x0, x1 = max(0, min(s[0], g[0], t[0]) - b), min(self.n, max(s[0], g[0], t[0]) + b + 1)
         y0, y1 = max(0, min(s[1], g[1], t[1]) - b), min(self.n, max(s[1], g[1], t[1]) + b + 1)
         with self._lock:
-            occ = self.occupied()[x0:x1, y0:y1]
-            unknown = (np.abs(self.lo[x0:x1, y0:y1]) < 0.3) & ~occ
+            wall = self.lo[x0:x1, y0:y1] > self.OCC_T
+            fresh = (self.sem_t[x0:x1, y0:y1] > 0) & (time.monotonic() - self.sem_t[x0:x1, y0:y1] < self.semantic_keep_s)
+            unknown = (np.abs(self.lo[x0:x1, y0:y1]) < 0.3) & ~wall & ~fresh
+        # A wall cell with no wall cell round it is one stray ToF reading: planned round, it closed 0.6 m of
+        # open floor (Nov 23: a third of all wall cells). The Pi's own costmap and reflex still see it.
+        p = np.pad(wall, 1)
+        wall &= (sum(np.roll(np.roll(p, a, 0), b, 1) for a in (-1, 0, 1) for b in (-1, 0, 1))[1:-1, 1:-1] > 1)
+        if target is not None:                                 # what the camera named near the person is them, or
+            ii, jj = np.ogrid[:wall.shape[0], :wall.shape[1]]  # theirs (Nov 23: 172 "suitcases", median 0.6 m away)
+            fresh &= np.hypot(ii - (t[0] - x0), jj - (t[1] - y0)) * self.res > SEM_PERSON_M
+        occ = wall | fresh
         field = distance_field(occ, self.res, cap_m=radius_m + 0.6)
         ls, lg, lt = (s[0] - x0, s[1] - y0), (g[0] - x0, g[1] - y0), (t[0] - x0, t[1] - y0)
         rb = 0.15 / self.res                                   # the target's own body: its last 0.15 m

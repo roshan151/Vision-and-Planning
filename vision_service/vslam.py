@@ -410,6 +410,17 @@ class MonoVSLAM:
         self.feed(buf.getvalue(), WARM_T, (0.0, 0.0, 0.0), 0.0, 0.0)
         self.frames_in -= 1                                # not one of the robot's
 
+    def forget(self) -> None:
+        """A new map frame: drop the SLAM-to-map alignment and the samples it was fitted from, so frames
+        from before (another run, `make test`'s recorded ones) cannot shift the next run's map.
+        ORB-SLAM3 itself keeps running."""
+        self._frames.clear()
+        self._pairs.clear()
+        self._tof.clear()
+        self._sim, self.tof_scale, self.scale_source, self.tracking = None, None, None, False
+        with self._lock:
+            self.odom_to_map = (0.0, 0.0, 0.0)
+
     def state(self) -> dict:
         return {"backend": self.backend, "ready": self._sys is not None, "reason": self.reason or None, "tracking": self.tracking,
                 "scaled": self._sim is not None, "scale_m_per_unit": None if self._sim is None else round(self._sim[0], 4),

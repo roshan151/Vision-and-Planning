@@ -5,6 +5,7 @@
 #
 #   bash deploy/install_orbslam3_macos.sh            # into ~/.robot-vision/orbslam3
 #   ORB_PREFIX=/opt/orb bash deploy/install_orbslam3_macos.sh
+#   ORB_REBUILD=1 bash deploy/install_orbslam3_macos.sh   # wipe and rebuild DBoW2, g2o, ORB-SLAM3 and the bindings
 #
 # What it does, each step stopping the script if it fails:
 #   1. Homebrew dependencies (cmake, eigen, opencv, boost, glew, openssl)
@@ -56,7 +57,13 @@ export LIBRARY_PATH="$(brew --prefix)/lib:$(brew --prefix openssl@3)/lib${LIBRAR
 # (binary_function, random_shuffle, auto_ptr) and the 'register' keyword, and keep deprecation noise down.
 COMPAT="-Wno-register -Wno-deprecated-declarations -D_LIBCPP_ENABLE_CXX17_REMOVED_FEATURES \
 -D_LIBCPP_ENABLE_CXX17_REMOVED_UNARY_BINARY_FUNCTION -D_LIBCPP_ENABLE_CXX17_REMOVED_RANDOM_SHUFFLE \
--D_LIBCPP_ENABLE_CXX17_REMOVED_AUTO_PTR -D_LIBCPP_ENABLE_CXX17_REMOVED_BINDERS"
+-D_LIBCPP_ENABLE_CXX17_REMOVED_AUTO_PTR -D_LIBCPP_ENABLE_CXX17_REMOVED_BINDERS -g"
+# ONE C++ standard for every library that passes g2o / Eigen objects to another. Editing the -std= flags alone did
+# not do it (Nov 23): g2o set none (AppleClang's default, C++98), DBoW2 got gnu++11 from OpenCV's target, Pangolin's
+# target appended -std=gnu++14 after ORB-SLAM3's c++17, and the bindings kept -march=native. ORB-SLAM3 then
+# segfaulted in its first bundle adjustment (g2o) after 3 of 5 map initialisations. CMAKE_CXX_STANDARD wins over
+# all of those. -g (above): a crash report then names the function and line.
+STD="-DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF"
 resign() { codesign -f -s - "$1" >/dev/null 2>&1 || true; }   # Apple Silicon refuses to load a binary edited unsigned
 
 step "2/7 Pangolin"
@@ -93,6 +100,9 @@ sed -i '' -e 's#lib/libDBoW2\.so#lib/libDBoW2${CMAKE_SHARED_LIBRARY_SUFFIX}#g' \
   -e 's#lib/libg2o\.so#lib/libg2o${CMAKE_SHARED_LIBRARY_SUFFIX}#g' CMakeLists.txt
 # a map whose allocator names the wrong pair type: libc++ rejects it (the well-known ORB-SLAM3 fix)
 sed -i '' 's/std::pair<const KeyFrame\*, *g2o::Sim3>/std::pair<KeyFrame* const, g2o::Sim3>/g' include/LoopClosing.h
+# a global-BA counter declared bool (++ on a bool is an error in C++17; as a bool it also stuck at 1, so a newer
+# global BA could never be told from an older one): the int it is used as
+sed -i '' 's/bool mnFullBAIdx;/int mnFullBAIdx;/' include/LoopClosing.h
 # They ask for OpenCV "3.0" / "4.4"; OpenCV only counts the same major version as a match, so ask for any
 sed -i '' -E 's/find_package\(OpenCV [0-9.]+/find_package(OpenCV/' CMakeLists.txt Thirdparty/DBoW2/CMakeLists.txt
 # Binary vocabulary: parsing the 145 MB ORBvoc.txt takes ~3 min on macOS (longer while the service is busy, past
@@ -100,13 +110,15 @@ sed -i '' -E 's/find_package\(OpenCV [0-9.]+/find_package(OpenCV/' CMakeLists.tx
 if ! grep -q loadFromBinaryFile Thirdparty/DBoW2/DBoW2/TemplatedVocabulary.h; then
   patch -p1 -N < "$REPO/deploy/orbslam3_binary_vocabulary.patch" || fail "ORB-SLAM3: binary vocabulary patch did not apply"
 fi
+[ -n "${ORB_REBUILD:-}" ] && rm -rf Thirdparty/DBoW2/build Thirdparty/g2o/build build \
+  Thirdparty/DBoW2/lib Thirdparty/g2o/lib lib "$SRC/ORB_SLAM3-PythonBindings/build" "$SRC/ORB_SLAM3-PythonBindings/lib"
 for d in Thirdparty/DBoW2 Thirdparty/g2o; do
   cmake -S "$d" -B "$d/build" -DCMAKE_BUILD_TYPE=Release -DOpenCV_DIR="$OPENCV_DIR" -DEigen3_DIR="$EIGEN_DIR" \
-    -DCMAKE_CXX_FLAGS="$COMPAT" \
+    -DCMAKE_CXX_FLAGS="$COMPAT" $STD \
     || fail "$d: cmake failed"
   cmake --build "$d/build" -j"$JOBS" || fail "$d: build failed"
 done
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PREFIX" -DCMAKE_CXX_FLAGS="$COMPAT" \
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PREFIX" -DCMAKE_CXX_FLAGS="$COMPAT" $STD \
   -DOpenCV_DIR="$OPENCV_DIR" -DEigen3_DIR="$EIGEN_DIR" \
   -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" || fail "ORB-SLAM3: cmake failed"
 cmake --build build -j"$JOBS" --target ORB_SLAM3 || fail "ORB-SLAM3: build failed (see above; usually a clang flag)"
@@ -175,6 +187,11 @@ cd "$SRC/ORB_SLAM3-PythonBindings"
 # written for Python 3.10: ask for this one instead
 sed -i '' -e "s/PythonLibs 3.10/PythonLibs $PYDOT/" -e "s/COMPONENTS python310/COMPONENTS python$PYVER/" \
   -e 's/\${PYTHON_LIBRARIES}//g' CMakeLists.txt     # an extension module takes Python from the interpreter
+sed -i '' -e 's/-march=native//g' -e 's/std=c++14/std=c++17/g' CMakeLists.txt   # the same flags as ORB-SLAM3 itself
+# get_tracked_mappoints: one entry per keypoint, NULL where it matched no map point; the bindings read them all
+# (SIGSEGV in MapPoint::GetWorldPos, python3.12 crash report 2026-11-23 15:00)
+grep -q 'Mps\[i\]->isBad' src/ORBSlamPython.cpp || sed -i '' \
+  's/for(size_t i=0; i<Mps.size(); i++)    {/& if (!Mps[i] || Mps[i]->isBad()) continue;/' src/ORBSlamPython.cpp
 PYINC="$("$PYBASE" -c 'import sysconfig; print(sysconfig.get_paths()["include"])')"
 PYLIB="$("$PYBASE" -c 'import sysconfig, os; print(os.path.join(sysconfig.get_config_var("LIBDIR"), sysconfig.get_config_var("LDLIBRARY")))')"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DORB_SLAM3_DIR="$PREFIX" -DCMAKE_PREFIX_PATH="$PREFIX" \
@@ -182,7 +199,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DORB_SLAM3_DIR="$PREFIX" -DCMAKE
   -DCMAKE_SHARED_LINKER_FLAGS="-undefined dynamic_lookup" \
   -DPYTHON_INCLUDE_DIR="$PYINC" -DPYTHON_LIBRARY="$PYLIB" \
   -DCMAKE_CXX_FLAGS="-std=c++17 $COMPAT -I$SRC/ORB_SLAM3 -I$SRC/ORB_SLAM3/include -I$SRC/ORB_SLAM3/include/CameraModels -I$SRC/ORB_SLAM3/Thirdparty/Sophus" \
-  -DOpenCV_DIR="$OPENCV_DIR" -DEigen3_DIR="$EIGEN_DIR" \
+  -DOpenCV_DIR="$OPENCV_DIR" -DEigen3_DIR="$EIGEN_DIR" $STD \
   || fail "bindings: cmake failed"
 cmake --build build -j"$JOBS" || fail "bindings: build failed"
 MOD="$(find lib build -maxdepth 2 \( -name 'orbslam3.so' -o -name 'orbslam3*.dylib' -o -name 'orbslam3*.so' \) 2>/dev/null | head -1)"
@@ -196,6 +213,15 @@ done
 resign "$SITE/orbslam3.so"
 
 step "7/7 Check"
+# every library that shares g2o / Eigen objects was compiled as C++17, without -march=native
+for f in "$SRC/ORB_SLAM3/Thirdparty/g2o/build/CMakeFiles/g2o.dir/flags.make" \
+         "$SRC/ORB_SLAM3/Thirdparty/DBoW2/build/CMakeFiles/DBoW2.dir/flags.make" \
+         "$SRC/ORB_SLAM3/build/CMakeFiles/ORB_SLAM3.dir/flags.make" \
+         "$SRC/ORB_SLAM3-PythonBindings/build/CMakeFiles/orbslam3.dir/flags.make"; do
+  bad="$(grep -oE -- '-std=[a-z+0-9]+|-march=native' "$f" | grep -v -- '-std=c++17' | sort -u | tr '\n' ' ')"
+  [ -z "$bad" ] || fail "$(basename "$(dirname "$(dirname "$(dirname "$f")")")"): still built with $bad"
+done
+echo "flags: g2o, DBoW2, ORB-SLAM3 and the bindings all C++17, no -march=native"
 cd "$REPO"
 "$PY" - <<PYEOF || fail "orbslam3 imports but will not start: see above"
 import orbslam3, pathlib, tempfile

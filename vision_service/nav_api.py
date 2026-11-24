@@ -63,6 +63,7 @@ class NavSession:
 
     def reset(self) -> None:
         self.map = GlobalMap(settings.slam_size_m, settings.slam_res_m)
+        self.vslam.forget()                  # a new map: the old SLAM -> map alignment means nothing in it
 
 
 def _inside(box, other) -> float:
