@@ -420,10 +420,40 @@ class Reconstruction:
         colors = np.clip(self.C[near[:, 0], near[:, 1], near[:, 2]], 0, 255).astype(np.uint8)
         verts = verts + self.origin + 0.5 * self.voxel        # voxel i's value is at its centre
         write_ply(out_ply, verts.astype(np.float32), colors, faces.astype(np.int32))
+        ortho_path = out_ply.with_name(f"{out_ply.stem}-ortho.png")
+        write_ortho_png(ortho_path, verts, colors)
         ext = verts.max(0) - verts.min(0) if len(verts) else np.zeros(3)
         rep.update(vertices=int(len(verts)), faces=int(len(faces)), mesh=str(out_ply),
-                   extent_m=[round(float(x), 2) for x in ext])
+                   ortho=str(ortho_path), extent_m=[round(float(x), 2) for x in ext])
         return rep
+
+
+def write_ortho_png(path: Path, verts: np.ndarray, colors: np.ndarray, res_m: float = 0.025,
+                    max_z_m: float = 1.6) -> Optional[Path]:
+    """Orthographic top-down RGB image of the coloured 3-D mesh (ignoring ceiling above max_z_m)."""
+    if len(verts) == 0:
+        return None
+    keep = verts[:, 2] <= max_z_m
+    v, c = (verts[keep], colors[keep]) if keep.any() else (verts, colors)
+    x0, y0 = float(v[:, 0].min()) - 0.1, float(v[:, 1].min()) - 0.1
+    x1, y1 = float(v[:, 0].max()) + 0.1, float(v[:, 1].max()) + 0.1
+    w = max(8, min(2048, int(math.ceil((x1 - x0) / res_m))))
+    h = max(8, min(2048, int(math.ceil((y1 - y0) / res_m))))
+    ix = np.clip(((v[:, 0] - x0) / res_m).astype(int), 0, w - 1)
+    iy = np.clip((h - 1) - ((v[:, 1] - y0) / res_m).astype(int), 0, h - 1)
+    order = np.argsort(v[:, 2])                               # highest non-ceiling surface wins
+    img = np.full((h, w, 3), 232, np.uint8)
+    img[iy[order], ix[order]] = c[order]
+    path = Path(path)
+    tmp = path.with_suffix(".tmp.png")
+    try:
+        from PIL import Image
+        Image.fromarray(img, "RGB").save(tmp)
+    except ModuleNotFoundError:
+        import cv2
+        cv2.imwrite(str(tmp), img[:, :, ::-1])
+    tmp.replace(path)
+    return path
 
 
 def write_ply(path: Path, verts: np.ndarray, colors: np.ndarray, faces: np.ndarray) -> None:

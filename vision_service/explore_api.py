@@ -44,7 +44,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from . import images, photos, recon
-from .plants import BadLabel, check_label
+from .plants import BadLabel, check_label, foliage_health
 from .runner import Busy
 from .settings import settings
 from .vlm import VLMUnavailable
@@ -132,12 +132,22 @@ async def plant_enroll(
         label = check_label(label) if label else st.plants.next_label()
     except (ValueError, BadLabel) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    raw, embeddings = [], []
+    raw, embeddings, health_samples = [], [], []
     for up in images_:
         data = await up.read()
-        v, _ = await st.runner.run(enc.embed, images.decode(data))
+        rgb = images.decode(data)
+        v, _ = await st.runner.run(enc.embed, rgb)
         raw.append(data)
         embeddings.append(v)
+        h_stat = foliage_health(rgb)
+        if h_stat["score"] is not None:
+            health_samples.append(h_stat)
+    if health_samples and "health" not in meta_d:
+        meta_d["health"] = {
+            "score": round(float(np.median([x["score"] for x in health_samples])), 1),
+            "green_pct": round(float(np.median([x["green_pct"] for x in health_samples])), 1),
+            "yellow_brown_pct": round(float(np.median([x["yellow_brown_pct"] for x in health_samples])), 1),
+        }
     try:
         res = await run_in_threadpool(st.plants.add_visit, label, raw, embeddings, meta_d)
     except ValueError as exc:

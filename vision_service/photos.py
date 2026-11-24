@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
-from PIL import Image
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +37,7 @@ def write_all(folder: Path, first: int, shots: Sequence[tuple]) -> None:
 
 
 def write(folder: Path, index: int, rgb: np.ndarray, bbox: Optional[Sequence[float]]) -> None:
+    from PIL import Image
     folder.mkdir(parents=True, exist_ok=True)
     Image.fromarray(rgb).save(folder / f"photo_{index}.png")
     (folder / f"bbox_{index}.txt").write_text(" ".join(f"{v:.1f}" for v in bbox) if bbox else "")

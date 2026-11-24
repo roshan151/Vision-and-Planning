@@ -51,6 +51,36 @@ def combine_positions(positions: list) -> tuple:
     return mid, round(spread, 3)
 
 
+def foliage_health(rgb: np.ndarray, bbox=None) -> dict:
+    """Fast, zero-LLM foliage health index from an RGB plant photo (or bbox crop).
+    Computes healthy-green vs yellow/brown-stressed pixel shares using Excess-Green
+    and HSV hue bands, returning {score (0..100 or None), green_pct, yellow_brown_pct}."""
+    h, w = rgb.shape[:2]
+    if bbox is not None and len(bbox) == 4:
+        x1, y1, x2, y2 = (max(0, int(round(bbox[0]))), max(0, int(round(bbox[1]))),
+                          min(w, int(round(bbox[2]))), min(h, int(round(bbox[3]))))
+        crop = rgb[y1:y2, x1:x2] if x2 > x1 + 4 and y2 > y1 + 4 else rgb
+    else:
+        my, mx = h // 5, w // 5
+        crop = rgb[my:h - my, mx:w - mx] if h >= 10 and w >= 10 else rgb
+    f = crop.astype(np.float32) / 255.0
+    r, g, b = f[..., 0], f[..., 1], f[..., 2]
+    mx_c, mn_c = np.maximum(np.maximum(r, g), b), np.minimum(np.minimum(r, g), b)
+    sat = np.where(mx_c > 1e-4, (mx_c - mn_c) / np.maximum(mx_c, 1e-4), 0.0)
+    val = mx_c
+    # Healthy foliage: green dominant (Excess-Green > 0.06) with real saturation and brightness
+    exg = 2.0 * g - r - b
+    green = (exg > 0.06) & (g > r * 1.02) & (sat > 0.18) & (val > 0.12)
+    # Stressed / chlorotic / dry foliage: warm yellow-brown tones (red >= green > blue, saturated)
+    yel = (~green) & (r >= g * 0.95) & (g > b * 1.15) & (r > b * 1.35) & (sat > 0.22) & (val > 0.15) & (val < 0.92)
+    total = max(1, int(crop.shape[0] * crop.shape[1]))
+    g_cnt, y_cnt = int(green.sum()), int(yel.sum())
+    g_pct, y_pct = round(100.0 * g_cnt / total, 1), round(100.0 * y_cnt / total, 1)
+    foliage = g_cnt + y_cnt
+    score = round(100.0 * g_cnt / foliage, 1) if (foliage / total) >= 0.02 else None
+    return {"score": score, "green_pct": g_pct, "yellow_brown_pct": y_pct}
+
+
 def check_label(label: str) -> str:
     # Labels become directory names: refuse anything that could escape the root.
     if not LABEL_RE.match(label or ""):
