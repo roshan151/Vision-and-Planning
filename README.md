@@ -263,17 +263,46 @@ Full request/response shapes: `http://<mac>:8080/docs`.
 | Endpoint | What it does |
 |---|---|
 | `POST /v1/plants/embed` | Plant crop → DINOv2 embedding |
-| `POST /v1/plants/match` | Embedding (+ map position) → best plants, each with similarity **and** distance from where it was last seen |
+| `POST /v1/plants/match` | Embedding (+ map position `[x, y]` or `[x, y, height]`) → best plants, each with similarity, its stored position (with height, when measured) **and** floor distance from where it was last seen |
 | `POST /v1/plants/enroll` | Photos + meta → a new `plant_NNN`, or a new visit when `label` is an existing plant. Embeddings are stored before it answers; the photos are written by a background task to `plants/map_{index}/plant_{NNN}/photo_{i}.png` + `bbox_{i}.txt` (`x1 y1 x2 y2` of the potted plant, empty if none found). `map_{index}` is bumped by each new `POST /v1/slam/reset` |
 | `GET /v1/plants` · `GET /v1/plants/{label}` · `GET /v1/plants/{label}/{file}` · `DELETE /v1/plants/{label}` | Register admin; delete moves photos to `_deleted/` |
 | `POST /v1/ask` | Images + question → answer from Gemini, or a local VLM via Ollama. `json=true` also parses the answer |
-| `POST /v1/slam/keyframe` | Odometry pose + TF-Luna rays → corrected pose, `map_to_odom`, next unexplored goal and path |
-| `POST /v1/slam/plan` · `POST /v1/slam/viewpoints` | Path between two points; reachable poses around a plant |
+| `POST /v1/slam/keyframe` | Odometry pose + rays (+ from the 8x8 ToF: `clear` free-space rays, `low` obstacles, `drops`, `cloud` 3-D points) → corrected pose, `map_to_odom`, `loop` (see below), next unexplored goal and path, with `goal.clear_m`: how close each leg passes to anything mapped (the robot drives roomy legs whole). Everything is saved in `maps/<name>.npz` |
+| `POST /v1/slam/plan` · `POST /v1/slam/viewpoints` | Path between two points (+ `clear_m` per leg); reachable poses around a plant. Paths keep 0.15 m more room from walls where the map allows (`pref_clearance`), else take the tightest way |
+| `GET /v1/slam/walls` | Straight walls fitted to the map, each with its length, and `extent`: the explored area's length and width along its main directions (several rooms explored together make one extent) |
 | `POST /v1/slam/reset` · `POST /v1/slam/save` · `GET /v1/slam/state` | Runs and saved maps (`reset` with `load: true` continues a saved map from a given start pose) |
-| `GET /v1/slam/map.png` | The map: free white, walls black, robot trail blue, plants red |
+| `GET /v1/slam/map.png` | The map: free white, walls black, low obstacles orange, drops (stairs down) magenta, robot trail blue, plants red with their height (plants on one stand listed together) |
 
 SLAM and `/v1/ask` run in worker threads, never through the GPU runner, so a
 slow map update or a 10 s VLM answer never delays `/v1/detect`.
+
+**Loop closure.** When a keyframe is back within 1.5 m of one taken at least 5
+keyframes and 3 m of driving ago, its scan is matched against the old keyframes
+alone. If they agree (fit at least 0.5) and the robot's chain of poses has drifted,
+the correction is spread along the keyframes in between, and the map is rebuilt
+from their stored readings. The keyframe answer's `loop` says what happened:
+`{"closed": true, "with_kf", "score", "correction_m", "correction_deg"}` or
+`{"closed": false}`. It works within one run; a run continuing a saved map
+rebuilds on top of the loaded map.
+
+**Plant positions** are the median of every visit's measured position (one bad
+ranging cannot drag it), with `position_spread_m` saying how far the visits
+disagree.
+
+### Follow mode: `POST /v1/follow/step` measurements
+
+Each `tracking` answer carries what the robot needs to decide its own move:
+- `bearing_deg`: in the robot's frame, with the head's pan added; + is left.
+- `distance_m` with `distance_from`, and `distance_sigma_m`, how far off it may be:
+  - ToF zones: about 5 cm
+  - feet on the floor: d²/h per degree of tilt error
+  - face size: 15 %
+  - box width: 30 %
+- `ground_xy`: where they stand, metres ahead and left of the robot when the frame was taken.
+- `confidence`: 1.0 for a face match, else how well their clothes match.
+
+`turn_deg` and `drive_m` are still sent. The robot uses them only while
+searching; while tracking, its own person tracker decides the turn and the leg.
 
 ### `GET /healthz` · `GET /v1/models` — ops
 
@@ -292,7 +321,49 @@ The field worth alerting on is **`queue_depth` climbing**: requests are arriving
 faster than the GPU retires them. `backend` is always `"real"` in the running
 service.
 
+### Debug uploads (`debug_api.py`)
+
+Not inference: the robot's `debug_mode` (robot.yaml `/voice debug_mode: true`) sends the camera frames and ToF grids its tasks collect, at most 2 a second, and they are stored exactly as sent for Monitoring-Service (`tof_camera_overlaid.py`) to show.
+
+| Endpoint | Body | Stores / returns |
+|---|---|---|
+| `POST /v1/debug/frame` | form field `meta` (JSON: `session`, `n`, `ts`, `frame`, `tof.rows` in metres, `geometry`, `extras`), optional `image` (JPEG) | `debug/<session>/<n>.jpg` and `.json` (plus `received`, this Mac's clock); `debug/latest.json` points at the newest |
+| `GET /v1/debug/latest` | | the newest upload's meta |
+
+Folder: `VS_DEBUG_DIR` (default `debug/` next to the code, gitignored). Only the newest `VS_DEBUG_KEEP` sessions (default 20) are kept; starting a new one deletes the oldest beyond that.
+
 ---
+
+## Global navigation (`nav_api.py`)
+
+The robot drives itself locally (DWA on a rolling costmap, `robot_core/nav` on the Pi); this
+service is its long-horizon layer.
+
+| Endpoint | What |
+|---|---|
+| `POST /v1/nav/frame` | the camera stream (~10 fps): `image`, `t`, `pose` (JSON x, y, heading), `pan_deg`, `tilt_deg` (real) -> visual SLAM |
+| `POST /v1/nav/plan` | `{pose, goal, radius_m, local}` -> `{path}`: Theta* waypoints in the Pi's odometry frame; `local` (the Pi's costmap) is folded into the map first |
+| `GET /v1/nav/state` | map size, plans, SLAM backend/tracking/scale, `odom_to_map` |
+| `GET /v1/nav/map.png` | the map: occupied black, free white, unknown grey, camera-found furniture orange, last path blue, robot red |
+| `POST /v1/nav/reset` | a new map |
+
+Visual SLAM is ORB-SLAM3 (monocular). Its metric scale comes from the ToF: the Pi sends the ToF grid
+nearest each frame, and the depths of the points ORB-SLAM3 tracks are compared with the ranges of the
+zones that see a flat surface there (corrected for each zone reporting the nearest point in its cone).
+Odometry only levels and places the map, and gives the scale until the ToF has 8 agreeing views. It is optional: install it
+with `bash deploy/install_orbslam3_macos.sh` (Homebrew deps, Pangolin, ORB-SLAM3, vocabulary,
+Python bindings, then a check). Until then `/v1/nav/state` shows `"backend": "none"` and the map
+runs on the Pi's odometry. Settings: `VS_ORB_VOCAB`, `VS_VSLAM=0` to turn it off,
+`VS_CAMERA_HFOV_DEG`, `VS_HEAD_X_M` / `VS_HEAD_Y_M` / `VS_HEAD_HEIGHT_M` (match robot.yaml).
+Calibrate the camera for best results: the intrinsics written to `~/.robot-vision/vslam/camera.yaml`
+are estimated from the field of view. ORB-SLAM3 is GPLv3.
+
+While a robot debug session is receiving uploads, everything this layer computes is saved beside
+them in `debug/<session>/nav/` (`nav_record.py`): `nav.jsonl` (SLAM status, every tracked frame,
+every SLAM pose and the base pose derived from it, each `odom_to_map` correction, the odometry fit
+with its point pairs, new-map events, every plan with its path, margin and timing, and camera-placed
+objects) and `map-NNNNNN.npz` snapshots of the global map (at most one per 2 s). Monitoring-Service's
+`tof_camera_overlaid.py --nav --session S` replays them next to the robot's own uploads.
 
 ## Errors
 
@@ -381,8 +452,8 @@ That runs, in order, stopping at the first failure:
 1. **`make install`**: creates `.venv` and installs `.[models,dev]`. Only does
    work when `pyproject.toml` has changed since the last install, so it's
    instant most of the time.
-2. **`make test`**: the test suite. A failing test stops the deploy, and the
-   old version keeps running.
+2. **`make check`**: the app imports and every route is mounted. A failure stops the
+   deploy, and the old version keeps running.
 3. **`make start`**: stops the running service, starts the new code, then
    waits for `/healthz` to answer (up to 180 s, since the first start
    downloads model weights) and prints it. If it never comes up, it prints
@@ -392,13 +463,14 @@ That runs, in order, stopping at the first failure:
 
 | Command | What it does |
 |---|---|
-| `make deploy` | Install if needed → test → restart → wait until healthy |
+| `make deploy` | Install if needed → check → restart → wait until healthy |
 | `make start` / `make restart` | Restart without reinstalling or testing |
 | `make stop` | Stop it. Stays stopped until `make start` or your next login |
 | `make status` | launchd state (running? pid? crash count?) + `/healthz` |
 | `make logs` | Follow the log. `Ctrl-C` to stop following |
 | `make run` | Run in this terminal instead (for debugging; `make stop` first) |
-| `make test` | Just the tests |
+| `make test` | Test every endpoint of the **running** service, ORB-SLAM3 included (`vision_service/selftest.py`; resets the follow map and explore session, removes what it adds) |
+| `make check` | Just the import / routes check |
 | `make reinstall` | Delete `.venv` and install from scratch |
 | `make uninstall` | Stop it and remove it from launchd entirely |
 | `make help` | List all of the above |
@@ -410,7 +482,7 @@ That runs, in order, stopping at the first failure:
 | Python environment | `.venv/` in this folder |
 | Your settings | `.env` in this folder (optional, see [Configuration](#configuration)) |
 | launchd job | `~/Library/LaunchAgents/com.roshan.visionservice.plist`, generated from `deploy/com.roshan.visionservice.plist.in` by `make start`, so its paths always point at this checkout |
-| Log | `~/Library/Logs/vision-service/vision-service.log`. The previous run's log is kept as `.log.1`. One timestamped line per request: client, endpoint, status, time taken, the inputs (uploaded images as name, bytes and pixel size; form fields) and the answer (embeddings shortened to `<512 numbers>`); see `vision_service/reqlog.py` |
+| Log | `~/Library/Logs/Vision-and-Planning/vision-and-planning.log`. The previous run's log is kept as `.log.1`. One timestamped line per request: client, endpoint, status, time taken, the inputs (uploaded images as name, bytes and pixel size; form fields) and the answer (embeddings shortened to `<512 numbers>`); see `vision_service/reqlog.py` |
 | Face gallery | `~/.robot-vision/gallery.npz` (`VS_GALLERY_PATH`) |
 | Model weights | Downloaded on first start: YOLO into this folder (gitignored), InsightFace into `~/.insightface`, Depth Anything into `~/.cache/huggingface` |
 
@@ -515,3 +587,7 @@ the first real frame blows the Pi's 0.6 s timeout.
 round trip: the difference is your network, and knowing which half is slow is
 worth more than either number alone. Phase V1 in VISION-DESIGN.md exists
 specifically to measure this before anything is built on top of it.
+
+
+## Test
+cp "$(ls -t ~/Library/Logs/DiagnosticReports/python3*.ips | head -1)" ~/src/Vision-And-Planning/debug/

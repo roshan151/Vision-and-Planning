@@ -1,0 +1,128 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>navigation debugging</title>
+<style>
+body{font:13px -apple-system,system-ui,sans-serif;margin:0;background:#1d1f22;color:#ddd}
+#top{display:flex;gap:8px;align-items:center;padding:6px 10px;background:#26292d}
+button{background:#3a3f45;color:#eee;border:0;border-radius:4px;padding:4px 9px;cursor:pointer}
+#slider{flex:1}
+#tl{display:block;width:100%;height:74px;cursor:pointer;background:#222}
+#main{display:flex;gap:8px;padding:8px}
+.panel{background:#000;border-radius:4px;position:relative}
+#hud{padding:6px 10px;font:12px ui-monospace,Menlo,monospace;white-space:pre;line-height:1.45}
+#bottom{display:flex;gap:8px;padding:0 8px 8px}
+#probs{flex:1;max-height:280px;overflow:auto;background:#26292d;border-radius:4px}
+#probs div{padding:3px 8px;cursor:pointer;border-left:4px solid}
+#probs div:hover,#probs div.on{background:#3a3f45}
+#note{flex:1;max-height:280px;overflow:auto;background:#26292d;border-radius:4px;font:11px ui-monospace,Menlo,monospace;white-space:pre;padding:6px}
+.lg{font-size:11px;color:#aaa;padding:2px 10px}
+.lg b{display:inline-block;width:10px;height:10px;margin:0 3px 0 10px;vertical-align:-1px}
+</style></head><body>
+<div id="top"><b id="title"></b><button id="play">▶ play</button><select id="speed"><option>0.5</option><option selected>1</option><option>2</option><option>4</option></select>
+<button id="prev">◀ problem</button><button id="next">problem ▶</button><input id="slider" type="range" min="0" step="0.05"><span id="clock"></span></div>
+<canvas id="tl"></canvas>
+<div class="lg">bands: follow <b style="background:#2e8b57"></b>tracking<b style="background:#c9a227"></b>searching<b style="background:#7b5ea7"></b>holding ·
+nav <b style="background:#2e8b57"></b>driving<b style="background:#d9534f"></b>tripped/blocked<b style="background:#3a7bd5"></b>arrived<b style="background:#555"></b>idle ·
+ORB <b style="background:#2e8b57"></b>tracking<b style="background:#555"></b>not<b style="background:#d9534f"></b>dead · ticks: problems (colours below)</div>
+<div id="main">
+ <div><canvas id="cam" class="panel" width="720" height="405"></canvas><div id="hud"></div></div>
+ <div><canvas id="map" class="panel" width="620" height="520"></canvas>
+ <div class="lg">wheel: zoom · drag: pan · double-click: follow the robot again ·
+ <b style="background:#000;border:1px solid #888"></b>wall<b style="background:#eb8c00"></b>YOLO mark<b style="background:#f0f"></b>ghost (on driven ground)
+ <b style="background:#e33"></b>plan<b style="background:#2c2"></b>trail<b style="background:#39f"></b>person<b style="background:#f44"></b>ToF obstacle<b style="background:#4c4"></b>ToF floor</div></div>
+</div>
+<div id="bottom"><div id="probs"></div><div id="note"></div></div>
+<script>
+const D={"session":"20261123-194111","hfov":80.0,"mount_y":-0.025,"calib":{},"R":0.177,"F":[],"E":[],"G":[],"P":[],"maps":{},"trk":[],"S":[],"sem":[],"problems":[],"dur":1.0};
+const KC={calib:'#ffffff',nopath:'#ff3b30',detour:'#ff9500',swap:'#ffcc00',reflex:'#ff2d92',blocked:'#d9534f',health:'#af52de',lost:'#5ac8fa',orb:'#8e8e93',explore:'#ff9500'};
+const $=id=>document.getElementById(id);
+let T=0,playing=false,view=null,imgs={},mapImgs={},probOn=-1;
+$('title').textContent=D.session; $('slider').max=D.dur;
+function last(a,t){let lo=0,hi=a.length-1,r=-1;while(lo<=hi){const m=(lo+hi)>>1;if(a[m].t<=t){r=m;lo=m+1}else hi=m-1}return r}
+function lastArr(a,t){let lo=0,hi=a.length-1,r=-1;while(lo<=hi){const m=(lo+hi)>>1;if(a[m][0]<=t){r=m;lo=m+1}else hi=m-1}return r}
+function nearest(a,t){const i=last(a,t);if(i<0)return a.length?0:-1;if(i+1<a.length&&a[i+1].t-t<t-a[i].t)return i+1;return i}
+function img(src,cache){if(!cache[src]){const im=new Image();im.onload=()=>draw();im.src=src;cache[src]=im}return cache[src]}
+function col(d){if(d==null)return null;const x=Math.max(0,Math.min(1,(d-0.15)/2.2));const h=x*230;return `hsla(${h},90%,50%,0.38)`}
+function pose(t){const i=lastArr(D.trk,t);return i<0?null:D.trk[i]}
+// ---------------------------------------------------------------- timeline
+function drawTL(){const c=$('tl'),g=c.getContext('2d');c.width=c.clientWidth;const W=c.width,X=t=>t/D.dur*W;
+ g.fillStyle='#222';g.fillRect(0,0,W,74);
+ const band=(y,pts,cf)=>{for(let i=0;i<pts.length;i++){const a=pts[i],b=pts[i+1];const c2=cf(a);if(!c2)continue;g.fillStyle=c2;g.fillRect(X(a.t),y,Math.max(1,X(b?b.t:D.dur)-X(a.t)),10)}};
+ band(4,D.E.filter(e=>e.n.task!='explore'),e=>({tracking:'#2e8b57',searching:'#c9a227',holding:'#7b5ea7'})[e.n.state]);
+ band(16,D.E.filter(e=>e.n.task!='explore'),e=>({driving:'#2e8b57',tripped:'#d9534f',blocked:'#d9534f',arrived:'#3a7bd5',idle:'#555'})[e.n.nav]);
+ band(28,D.S.map(s=>({t:s[0],v:s[1]})),s=>s.v>0?'#2e8b57':s.v<0?'#d9534f':'#555');
+ g.fillStyle='#888';g.font='10px sans-serif';g.fillText('follow',2,12);g.fillText('nav',2,24);g.fillText('ORB',2,36);
+ for(const e of D.E.filter(e=>e.n.task=='explore')){g.fillStyle='#bbb';g.fillRect(X(e.t),4,1,34)}
+ for(const p of D.problems){g.fillStyle=KC[p.k]||'#fff';g.fillRect(X(p.t)-1,42,Math.max(3,X(p.t1)-X(p.t)+2),28)}
+ g.fillStyle='#fff';g.fillRect(X(T)-1,0,2,74)}
+$('tl').onclick=e=>seek(e.offsetX/$('tl').clientWidth*D.dur);
+// ---------------------------------------------------------------- camera
+function drawCam(){const c=$('cam'),g=c.getContext('2d');g.fillStyle='#000';g.fillRect(0,0,c.width,c.height);
+ const fi=last(D.F,T);let hud=[];if(fi<0){$('hud').textContent='no frames yet';return}
+ const F=D.F[fi],im=img(F.img,imgs);
+ if(im.complete&&im.naturalWidth){const k=Math.min(c.width/im.naturalWidth,c.height/im.naturalHeight);const w=im.naturalWidth*k,h=im.naturalHeight*k,ox=(c.width-w)/2,oy=(c.height-h)/2;
+  g.drawImage(im,ox,oy,w,h);const f=(w/2)/Math.tan(D.hfov/2*Math.PI/180);
+  const gi=nearest(D.G,F.t);
+  if(gi>=0&&Math.abs(D.G[gi].t-F.t)<0.6){const G=D.G[gi],dp=G.pan-F.pan,dt=G.tilt-F.tilt;
+   for(let r=0;r<8;r++)for(let cc=0;cc<8;cc++){const k2=r*8+cc,d=G.d[k2],cl=G.c[k2];
+    const L=(3.5-cc)*7.5+dp,U=(3.5-r)*7.5+dt,R=Math.PI/180;
+    const u0=ox+w/2-f*Math.tan((L+3.75)*R),u1=ox+w/2-f*Math.tan((L-3.75)*R),v0=oy+h/2-f*Math.tan((U+3.75)*R),v1=oy+h/2-f*Math.tan((U-3.75)*R);
+    if(d!=null&&cl>=0){g.fillStyle=cl==3?'rgba(128,128,128,0.45)':col(d);g.fillRect(u0,v0,u1-u0,v1-v0)}
+    g.strokeStyle=cl==1?'#ff3030':cl==0?'#30d030':cl==2?'#6af':'rgba(255,255,255,0.25)';g.lineWidth=cl==1||cl==0?2:1;g.strokeRect(u0+1,v0+1,u1-u0-2,v1-v0-2);
+    g.fillStyle='#fff';g.font='11px Menlo,monospace';g.fillText(d==null?'·':d.toFixed(2),u0+3,v0+13)}
+   hud.push(`ToF grid ${(G.t-F.t>=0?'+':'')+(G.t-F.t).toFixed(2)} s from the frame, head moved ${dp.toFixed(1)}° pan ${dt.toFixed(1)}° tilt between them`)}
+  else hud.push('no ToF grid within 0.6 s of this frame');
+  if(F.b&&F.b.wh){const sx=w/F.b.wh[0],sy=h/F.b.wh[1];for(const [b,face,pick] of F.b.p){g.strokeStyle=pick?'#39f':'#9cf';g.lineWidth=pick?4:1.5;g.strokeRect(ox+b[0]*sx,oy+b[1]*sy,(b[2]-b[0])*sx,(b[3]-b[1])*sy);if(face){g.fillStyle='#39f';g.fillText(face,ox+b[0]*sx+3,oy+b[1]*sy+14)}}}}
+ const ei=last(D.E,T);
+ hud.unshift(`t ${T.toFixed(2)} s   frame ${F.img}   head pan ${F.pan}° tilt ${F.tilt}°`);
+ if(ei>=0){const E=D.E[ei],n=E.n;
+  if(n.task=='explore')hud.push(`explore: ${n.msg}`);
+  else{hud.push(`follow ${n.state}  distance ${n.distance_m==null?'-':n.distance_m.toFixed(2)} m (${n.distance_from||'-'})  bearing ${n.bearing_deg==null?'-':n.bearing_deg.toFixed(0)}°`);
+   hud.push(`nav ${n.nav} ${n.nav_detail||''}  via ${n.nav_source}  cmd ${JSON.stringify(n.cmd)}  reflex trips ${n.reflex_trips}  health ${JSON.stringify(n.health)}`);
+   const ex=D.E.slice(0,ei+1).reverse().find(e=>e.n.task=='explore');if(ex)hud.push(`explore: ${ex.n.msg}`)}
+  $('note').textContent=`event at ${E.t.toFixed(2)} s\n`+JSON.stringify(n,null,1)}
+ const pi=last(D.P,T);if(pi>=0){const P=D.P[pi];hud.push(`plan at ${P.t.toFixed(1)} s: ${P.len==null?'NO PATH':P.len.toFixed(2)+' m'} for ${P.straight} m straight, margin ${P.margin}${P.door?'  door '+JSON.stringify(P.door):''}`)}
+ $('hud').textContent=hud.join('\n')}
+// ---------------------------------------------------------------- map
+function drawMap(){const c=$('map'),g=c.getContext('2d');g.fillStyle='#777';g.fillRect(0,0,c.width,c.height);
+ const p=pose(T);if(!view)view={s:90,follow:true,cx:0,cy:0};if(view.follow&&p){view.cx=p[1];view.cy=p[2]}
+ const X=x=>c.width/2+(x-view.cx)*view.s,Y=y=>c.height/2-(y-view.cy)*view.s;
+ const pi=last(D.P,T),P=pi>=0?D.P[pi]:null,M=P&&D.maps[P.map];
+ if(M){const im=img(M.png,mapImgs);if(im.complete){g.imageSmoothingEnabled=false;g.drawImage(im,X(M.x0),Y(M.y0+M.ny*M.res),M.nx*M.res*view.s,M.ny*M.res*view.s)}}
+ // ToF hits: all so far faint (the only map in explore), last 3 s stronger, this grid bold
+ const gi=last(D.G,T);
+ for(let i=M?Math.max(0,gi-150):0;i<=gi;i++){const G=D.G[i],age=T-G.t,bold=i==gi;if(M&&age>3&&!bold)continue;
+  for(let k=0;k<G.h.length;k+=3){const ob=G.h[k+2]==1;if(!M&&!ob&&age>3)continue;g.fillStyle=bold?(ob?'#f22':'#3c3'):age<=3?(ob?'rgba(255,60,60,0.45)':'rgba(60,200,60,0.35)'):'rgba(0,0,0,0.25)';const r=bold?3:2;g.fillRect(X(G.h[k])-r/2,Y(G.h[k+1])-r/2,r,r)}}
+ for(const s of D.sem)if(s.t<=T&&T-s.t<120){g.strokeStyle='#eb8c00';g.beginPath();g.arc(X(s.xy[0]),Y(s.xy[1]),Math.max(3,(s.r||0.1)*view.s),0,7);g.stroke();g.fillStyle='#eb8c00';g.fillText(s.cls,X(s.xy[0])+5,Y(s.xy[1])-5)}
+ // trail and person track
+ g.fillStyle='#2c2';const ti=lastArr(D.trk,T);for(let i=Math.max(0,ti-6000);i<=ti;i+=3){const q=D.trk[i];g.fillRect(X(q[1])-1,Y(q[2])-1,2,2)}
+ for(const e of D.E)if(e.person&&e.t<=T&&T-e.t<30){g.fillStyle=T-e.t<1?'#39f':'rgba(50,150,255,0.5)';g.beginPath();g.arc(X(e.person[0]),Y(e.person[1]),T-e.t<1?5:2.5,0,7);g.fill()}
+ if(P){if(P.start&&P.goal){g.setLineDash([5,5]);g.strokeStyle='#fff';g.lineWidth=1;g.beginPath();g.moveTo(X(P.start[0]),Y(P.start[1]));g.lineTo(X(P.goal[0]),Y(P.goal[1]));g.stroke();g.setLineDash([])}
+  if(P.path.length){g.strokeStyle='#e33';g.lineWidth=2.5;g.beginPath();P.path.forEach((q,i)=>i?g.lineTo(X(q[0]),Y(q[1])):g.moveTo(X(q[0]),Y(q[1])));g.stroke()}
+  if(P.goal){g.strokeStyle='#f0f';g.lineWidth=2;g.beginPath();g.arc(X(P.goal[0]),Y(P.goal[1]),7,0,7);g.stroke()}
+  if(P.target){g.strokeStyle='#39f';g.lineWidth=2;const u=X(P.target[0]),v=Y(P.target[1]);g.beginPath();g.moveTo(u-6,v-6);g.lineTo(u+6,v+6);g.moveTo(u+6,v-6);g.lineTo(u-6,v+6);g.stroke()}}
+ // robot: body, heading, ToF field of view (from the head's pan axis)
+ if(p){const [_,x,y,th]=p,G=gi>=0?D.G[gi]:null,pan=(G?G.pan:0)*Math.PI/180,R=D.R;
+  const sx=x-Math.sin(th)*D.mount_y,sy=y+Math.cos(th)*D.mount_y;
+  g.fillStyle='rgba(255,255,0,0.12)';g.beginPath();g.moveTo(X(sx),Y(sy));for(let a=-30;a<=30;a+=5){const b=th+pan+a*Math.PI/180;g.lineTo(X(sx+2.4*Math.cos(b)),Y(sy+2.4*Math.sin(b)))}g.fill();
+  g.strokeStyle='#ff0';g.lineWidth=2;g.beginPath();g.arc(X(x),Y(y),R*view.s,0,7);g.stroke();
+  g.beginPath();g.moveTo(X(x),Y(y));g.lineTo(X(x+R*1.4*Math.cos(th)),Y(y+R*1.4*Math.sin(th)));g.stroke()}
+ g.fillStyle='#fff';g.fillText(`${(1/view.s*100).toFixed(1)} cm/px${M?'':'  (no Mac map in this run: ToF hits only)'}`,6,c.height-6)}
+(()=>{const c=$('map');let drag=null;
+ c.onwheel=e=>{e.preventDefault();view.s*=e.deltaY<0?1.15:1/1.15;draw()};
+ c.onmousedown=e=>drag=[e.offsetX,e.offsetY,view.cx,view.cy];window.onmouseup=()=>drag=null;
+ c.onmousemove=e=>{if(!drag)return;view.follow=false;view.cx=drag[2]-(e.offsetX-drag[0])/view.s;view.cy=drag[3]+(e.offsetY-drag[1])/view.s;draw()};
+ c.ondblclick=()=>{view.follow=true;draw()}})();
+// ---------------------------------------------------------------- problems, controls
+const pl=$('probs');D.problems.forEach((p,i)=>{const d=document.createElement('div');d.style.borderColor=KC[p.k]||'#fff';
+ d.textContent=`${p.t.toFixed(1)} s  ${p.k}  ${p.txt}${p.n>1?`  (×${p.n}, to ${p.t1.toFixed(1)} s)`:''}`;d.onclick=()=>{seek(Math.max(0,p.t-1.5));probOn=i};pl.appendChild(d)});
+if(!D.problems.length)pl.textContent='no problems found';
+function draw(){drawTL();drawCam();drawMap();$('slider').value=T;$('clock').textContent=`${T.toFixed(1)} / ${D.dur.toFixed(0)} s`;
+ [...pl.children].forEach((d,i)=>d.classList.toggle('on',D.problems[i]&&D.problems[i].t<=T+2&&D.problems[i].t1>=T-2))}
+function seek(t){T=Math.max(0,Math.min(D.dur,t));draw()}
+$('slider').oninput=e=>{seek(+e.target.value)};
+$('play').onclick=()=>{playing=!playing;$('play').textContent=playing?'❚❚ pause':'▶ play';if(playing){let w=performance.now();const tick=n=>{if(!playing)return;T+=(n-w)/1000*+$('speed').value;w=n;if(T>=D.dur){T=D.dur;playing=false;$('play').textContent='▶ play'}draw();requestAnimationFrame(tick)};requestAnimationFrame(tick)}};
+const jump=dir=>{const ps=D.problems;const i=dir>0?ps.findIndex(p=>p.t>T+1.6):ps.map(p=>p.t<T+1.4).lastIndexOf(true)-1;const p=ps[Math.max(0,i)];if(p)seek(Math.max(0,p.t-1.5))};
+$('next').onclick=()=>jump(1);$('prev').onclick=()=>jump(-1);
+document.onkeydown=e=>{if(e.key==' '){e.preventDefault();$('play').click()}else if(e.key=='ArrowRight'){const i=last(D.F,T);if(i+1<D.F.length)seek(D.F[i+1].t)}
+ else if(e.key=='ArrowLeft'){const i=last(D.F,T-1e-3);if(i>=0)seek(D.F[Math.max(0,i)].t)}else if(e.key=='n')jump(1);else if(e.key=='p')jump(-1)};
+window.onresize=draw;seek(0);
+</script></body></html>

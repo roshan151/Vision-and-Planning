@@ -1,7 +1,8 @@
 # Vision service: install, test and run it on the Mac mini.
 #
 #   make help      list every target
-#   make deploy    after any code change: install deps if needed, test, restart
+#   make deploy    after any code change: install deps if needed, check, restart
+#   make test      exercise every endpoint of the RUNNING service, ORB-SLAM3 included
 #
 # Everything here is plain launchd + a Python venv. See README.md, "Deploying".
 
@@ -21,15 +22,17 @@ LABEL          := com.roshan.visionservice
 DOMAIN         := gui/$(shell id -u)
 PLIST_SRC      := deploy/$(LABEL).plist.in
 PLIST_DST      := $(HOME)/Library/LaunchAgents/$(LABEL).plist
-LOG_DIR        := $(HOME)/Library/Logs/vision-service
-LOG_FILE       := $(LOG_DIR)/vision-service.log
+LOG_DIR        := $(HOME)/Library/Logs/Vision-and-Planning
+LOG_FILE       := $(LOG_DIR)/vision-and-planning.log
 
 HEALTH_URL     := http://127.0.0.1:$(VS_PORT)/healthz
 # First start after install downloads model weights; give it time.
 HEALTH_TIMEOUT ?= 180
+# ORB-SLAM3 loads its vocabulary after the service is up (vslam._OrbProcess gives it 300 s).
+VSLAM_TIMEOUT  ?= 330
 
-.PHONY: help install reinstall test run deploy start restart stop uninstall \
-        status health logs wait-healthy clean
+.PHONY: help install reinstall check test run deploy start restart stop uninstall \
+        status health logs wait-healthy wait-vslam clean FORCE
 
 help: ## Show this list
 	@grep -E '^[a-z-]+:.*## ' $(firstword $(MAKEFILE_LIST)) | \
@@ -37,14 +40,18 @@ help: ## Show this list
 
 # ---------------------------------------------------------------- build ---
 
-install: $(STAMP) ## Create .venv and install deps (only redoes work when pyproject.toml changes)
+install: $(STAMP) ## Create .venv and install deps (only redoes work when pyproject.toml or requirements.txt change)
 
-$(STAMP): pyproject.toml
+$(STAMP): pyproject.toml requirements.txt
 	@test -d $(VENV) || { \
 	  $(PYTHON) -c 'import sys; sys.exit(sys.version_info < (3, 10))' \
 	    || { echo "Need Python >= 3.10 (macOS's own python3 is 3.9). Try: brew install python, or make PYTHON=python3.12 install"; exit 1; }; \
 	  $(PYTHON) -m venv $(VENV); }
 	$(PY) -m pip install --quiet --upgrade pip
+	@# The package was called robot-vision-service before: drop that install, which still maps
+	@# vision_service to the old Vision-Microservice folder.
+	-@$(PY) -m pip uninstall --quiet -y robot-vision-service 2>/dev/null
+	$(PY) -m pip install -r requirements.txt
 	$(PY) -m pip install -e '.[models,dev]'
 	@touch $@
 
@@ -52,16 +59,28 @@ reinstall: ## Delete .venv and install everything from scratch
 	rm -rf $(VENV)
 	@$(MAKE) --no-print-directory install
 
-test: $(STAMP) ## Run the test suite (~1 s, no models or GPU needed)
-	$(PY) -m pytest -q
+# Checks the service imports and every router is mounted, so `make deploy` never restarts into a broken app.
+check: $(STAMP) ## Check the app imports and its routes are all there (~2 s, no models loaded)
+	$(PY) -c "import vision_service.app as a; p = a.app.openapi()['paths']; \
+	missing = [r for r in ('/healthz', '/v1/follow/step', '/v1/nav/plan', '/v1/slam/keyframe', '/v1/debug/frame') if r not in p]; \
+	assert not missing, f'routes missing: {missing}'; print(f'app OK: {len(p)} routes')"
 
 # -------------------------------------------------------------- service ---
 
-deploy: install test start ## Rebuild after a change: install if needed, test, restart, wait until healthy
+# Live: every endpoint of the service as it runs now, ORB-SLAM3 fed a recorded run (vision_service/selftest.py).
+# Resets the follow map and the explore SLAM session (the robot should be idle); removes what it adds.
+test: $(STAMP) ## Test every endpoint of the running service, ORB-SLAM3 included (~1-2 min; make start first)
+	$(PY) -m vision_service.selftest --url http://127.0.0.1:$(VS_PORT)
+
+deploy: install check start ## Rebuild after a change: install if needed, check, restart, wait until healthy
 
 # The installed plist is generated from the template, so its paths always
-# point at this checkout. Re-rendered whenever the template changes.
-$(PLIST_DST): $(PLIST_SRC)
+# point at this checkout. Re-rendered whenever the template changes, and whenever
+# it points at another folder or log file (the repo was moved or renamed: launchd
+# would try to start a run.sh that is not there, or log where nobody looks).
+PLIST_STALE := $(shell grep -qsF '$(CURDIR)/run.sh' $(PLIST_DST) && grep -qsF '$(LOG_FILE)' $(PLIST_DST) || echo FORCE)
+FORCE:
+$(PLIST_DST): $(PLIST_SRC) $(PLIST_STALE)
 	@mkdir -p $(dir $@) $(LOG_DIR)
 	sed -e 's|__REPO_DIR__|$(CURDIR)|g' -e 's|__LOG_FILE__|$(LOG_FILE)|g' $< > $@
 	@plutil -lint -s $@
@@ -107,6 +126,7 @@ start: $(STAMP) $(PLIST_DST) ## (Re)start the service in the background; it also
 	@if [[ -f $(LOG_FILE) ]]; then mv -f $(LOG_FILE) $(LOG_FILE).1; fi
 	launchctl bootstrap $(DOMAIN) $(PLIST_DST)
 	@$(MAKE) --no-print-directory wait-healthy
+	@$(MAKE) --no-print-directory wait-vslam
 
 restart: start ## Same as start
 
@@ -155,6 +175,23 @@ wait-healthy:
 	done; \
 	echo; echo "not healthy after $(HEALTH_TIMEOUT)s. Last lines of $(LOG_FILE):"; \
 	tail -n 40 $(LOG_FILE); exit 1
+
+# Fails `make start` (the service keeps running, on the PyMonoVO fallback) unless visual SLAM comes up as
+# ORB-SLAM3. VS_VSLAM=0 passes.
+wait-vslam: ## Wait for ORB-SLAM3 to load; fail if it fell back
+	@printf "waiting for ORB-SLAM3 "; \
+	for i in $$(seq 1 $(VSLAM_TIMEOUT)); do \
+	  v=$$(curl -fsS -m 2 $(HEALTH_URL) 2>/dev/null | $(PYTHON) -c 'import json, sys; s = json.load(sys.stdin).get("vslam") or {}; print(s.get("backend"), "ready" if s.get("ready") else "loading", s.get("reason") or "")' 2>/dev/null); \
+	  case "$$v" in \
+	    "orbslam3 ready"*) echo " ready after $${i}s"; exit 0;; \
+	    none*disabled*) echo " disabled (VS_VSLAM=0)"; exit 0;; \
+	    "orbslam3 loading"*|"") printf "."; sleep 1;; \
+	    *) echo; echo "ORB-SLAM3 FAILED: $$v"; break;; \
+	  esac; \
+	done; \
+	[[ "$$v" == "orbslam3 loading"* || -z "$$v" ]] && { echo; echo "ORB-SLAM3 FAILED: not ready after $(VSLAM_TIMEOUT)s"; }; \
+	echo "ORB-SLAM3 lines in $(LOG_FILE):"; \
+	grep -iE "vslam|orb|slam3|vocab" $(LOG_FILE) | tail -n 30; exit 1
 
 clean: ## Remove caches (keeps .venv)
 	find . -name __pycache__ -type d -prune -not -path './$(VENV)/*' -exec rm -rf {} +
