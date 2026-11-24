@@ -153,7 +153,7 @@ async def _save_plant_photos(st, folder: Path, files: list, raw: list) -> None:
             bbox = None
             try:
                 dets, _ = await st.runner.run(st.backend.detector.detect, frame, PLANT_BBOX_MIN_CONF)
-                plants = [d for d in dets if d.cls == PLANT_CLASS]
+                plants = [d for d in dets if d.cls in settings.plant_classes]
                 bbox = max(plants, key=lambda d: d.confidence).bbox if plants else None
             except Exception as exc:                        # noqa: BLE001  (busy/timeout: keep the photo)
                 log.warning("bbox detection skipped for %s: %s", name, exc)

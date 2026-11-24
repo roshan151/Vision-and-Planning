@@ -183,21 +183,30 @@ def base_from_camera(R_wc: np.ndarray, p_wc: np.ndarray, pan_deg: float, tilt_de
 
 
 def settings_yaml(path: Path, width: int, height: int, hfov_deg: float, fps: float = 10.0,
-                  dist: Sequence[float] = (0.0, 0.0, 0.0, 0.0)) -> Path:
-    """An ORB-SLAM3 settings file for the robot's camera. Pinhole from the horizontal field of
-    view; replace fx/fy/cx/cy and k1 k2 p1 p2 with a real calibration (the USB HD lens bends)."""
-    fx = (width / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
+                  dist: Sequence[float] = (0.0, 0.0, 0.0, 0.0),
+                  intrinsics: Optional[Sequence[float]] = None) -> Path:
+    """An ORB-SLAM3 settings file for the robot's camera. Uses calibrated (fx, fy, cx, cy, calib_w, calib_h)
+    scaled to (width, height) when provided (fx > 0 and fy > 0); otherwise estimates pinhole from hfov_deg."""
+    if intrinsics and len(intrinsics) >= 6 and intrinsics[0] > 0 and intrinsics[1] > 0:
+        sx = width / max(1.0, float(intrinsics[4]))
+        sy = height / max(1.0, float(intrinsics[5]))
+        fx, fy = float(intrinsics[0]) * sx, float(intrinsics[1]) * sy
+        cx, cy = float(intrinsics[2]) * sx, float(intrinsics[3]) * sy
+    else:
+        fx = fy = (width / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
+        cx, cy = width / 2.0, height / 2.0
+    d = list(dist) + [0.0, 0.0, 0.0, 0.0]
     path.write_text(f"""%YAML:1.0
 File.version: "1.0"
 Camera.type: "PinHole"
 Camera1.fx: {fx:.3f}
-Camera1.fy: {fx:.3f}
-Camera1.cx: {width / 2.0:.3f}
-Camera1.cy: {height / 2.0:.3f}
-Camera1.k1: {dist[0]}
-Camera1.k2: {dist[1]}
-Camera1.p1: {dist[2]}
-Camera1.p2: {dist[3]}
+Camera1.fy: {fy:.3f}
+Camera1.cx: {cx:.3f}
+Camera1.cy: {cy:.3f}
+Camera1.k1: {d[0]}
+Camera1.k2: {d[1]}
+Camera1.p1: {d[2]}
+Camera1.p2: {d[3]}
 Camera.width: {width}
 Camera.height: {height}
 Camera.fps: {int(fps)}
@@ -334,8 +343,12 @@ class PyMonoVO:
 
 class MonoVSLAM:
     def __init__(self, vocab: Optional[str], hfov_deg: float = 80.0, mount=(0.05, -0.0275, 0.22),
-                 work_dir: Optional[Path] = None, enabled: bool = True) -> None:
+                 work_dir: Optional[Path] = None, enabled: bool = True,
+                 dist: Sequence[float] = (0.0, 0.0, 0.0, 0.0),
+                 intrinsics: Optional[Sequence[float]] = None) -> None:
         self.hfov, self.mount = hfov_deg, tuple(mount)
+        self.dist = tuple(float(x) for x in dist)
+        self.intrinsics = tuple(intrinsics) if intrinsics is not None else None
         self.work_dir = Path(work_dir or Path.home() / ".robot-vision" / "vslam")
         self.backend, self.reason = "none", ""
         self._orb = None
@@ -455,7 +468,8 @@ class MonoVSLAM:
     def _start(self, w: int, h: int) -> None:
         if self.backend == "orbslam3":
             self.work_dir.mkdir(parents=True, exist_ok=True)
-            cfg = settings_yaml(self.work_dir / "camera.yaml", w, h, self.hfov)
+            cfg = settings_yaml(self.work_dir / "camera.yaml", w, h, self.hfov,
+                                dist=self.dist, intrinsics=self.intrinsics)
             try:
                 if os.environ.get("VS_VSLAM_INPROC") == "1":
                     import orbslam3
@@ -561,7 +575,8 @@ class MonoVSLAM:
         age = float(tof.get("age_s") or 0.0)
         if parsed is None or abs(parsed[0] - t) > 1e-3 or abs(age) > TOF_MAX_AGE_S:
             return                                        # not this frame's pose, or the grid too far off
-        pts = list(self._sys.get_tracked_mappoints()) if hasattr(self._sys, "get_tracked_mappoints") else []
+        raw_pts = list(self._sys.get_tracked_mappoints()) if hasattr(self._sys, "get_tracked_mappoints") else []
+        pts = [p for p in raw_pts if p is not None and len(p) >= 3 and all(math.isfinite(float(v)) for v in p[:3])]
         samples = tof_scale_samples(pts, parsed[1], parsed[2], tof.get("rows"))
         est = float(np.median(samples)) if len(samples) >= TOF_MIN_POINTS else None
         if est is not None:

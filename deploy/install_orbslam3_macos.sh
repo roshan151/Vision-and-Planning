@@ -189,9 +189,18 @@ sed -i '' -e "s/PythonLibs 3.10/PythonLibs $PYDOT/" -e "s/COMPONENTS python310/C
   -e 's/\${PYTHON_LIBRARIES}//g' CMakeLists.txt     # an extension module takes Python from the interpreter
 sed -i '' -e 's/-march=native//g' -e 's/std=c++14/std=c++17/g' CMakeLists.txt   # the same flags as ORB-SLAM3 itself
 # get_tracked_mappoints: one entry per keypoint, NULL where it matched no map point; the bindings read them all
-# (SIGSEGV in MapPoint::GetWorldPos, python3.12 crash report 2026-11-23 15:00)
-grep -q 'Mps\[i\]->isBad' src/ORBSlamPython.cpp || sed -i '' \
-  's/for(size_t i=0; i<Mps.size(); i++)    {/& if (!Mps[i] || Mps[i]->isBad()) continue;/' src/ORBSlamPython.cpp
+# (SIGSEGV in MapPoint::GetWorldPos, python3.12 crash report 2026-11-23 15:00). Match any whitespace around the brace
+# and verify the guard is actually present before compiling.
+"$PY" - <<'PYPATCH' || fail "bindings: could not patch getTrackedMappoints NULL guard in src/ORBSlamPython.cpp"
+import pathlib, re
+p = pathlib.Path("src/ORBSlamPython.cpp")
+s = p.read_text()
+if "Mps[i]->isBad()" not in s:
+    s2, n = re.subn(r"(for\s*\([^)]*Mps\.size\(\)[^)]*\)\s*\{)", r"\1 if (!Mps[i] || Mps[i]->isBad()) continue;", s)
+    assert n >= 1, "pattern for Mps.size() loop not found"
+    p.write_text(s2)
+assert "Mps[i]->isBad()" in p.read_text()
+PYPATCH
 PYINC="$("$PYBASE" -c 'import sysconfig; print(sysconfig.get_paths()["include"])')"
 PYLIB="$("$PYBASE" -c 'import sysconfig, os; print(os.path.join(sysconfig.get_config_var("LIBDIR"), sysconfig.get_config_var("LDLIBRARY")))')"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DORB_SLAM3_DIR="$PREFIX" -DCMAKE_PREFIX_PATH="$PREFIX" \

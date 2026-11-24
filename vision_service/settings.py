@@ -35,8 +35,23 @@ class Settings:
     port: int = field(default_factory=lambda: _env_i("VS_PORT", 8080))
 
     # --- models ----------------------------------------------------------
+    # Set VS_DETECT_MODEL=yolov8s-worldv2.pt (or yolov8m-worldv2.pt) for open-vocabulary
+    # outdoor + indoor plant detection (uses VS_OPEN_VOCAB_CLASSES). Standard yolov8m.pt uses COCO.
     detect_model: str = field(default_factory=lambda: _env("VS_DETECT_MODEL", "yolov8m.pt"))
     detect_imgsz: int = field(default_factory=lambda: _env_i("VS_DETECT_IMGSZ", 640))
+    open_vocab_classes: list[str] = field(
+        default_factory=lambda: [c.strip() for c in _env(
+            "VS_OPEN_VOCAB_CLASSES",
+            "person,potted plant,plant,shrub,bush,flower,garden bed,tree,"
+            "chair,couch,bed,dining table,bench,backpack,handbag,bicycle,motorcycle,vase",
+        ).split(",") if c.strip()]
+    )
+    plant_classes: set[str] = field(
+        default_factory=lambda: {c.strip() for c in _env(
+            "VS_PLANT_CLASSES",
+            "potted plant,plant,shrub,bush,flower,garden bed,houseplant,fern,succulent,tree",
+        ).split(",") if c.strip()}
+    )
     face_model: str = field(default_factory=lambda: _env("VS_FACE_MODEL", "buffalo_l"))
     depth_model: str = field(
         default_factory=lambda: _env("VS_DEPTH_MODEL", "depth-anything/Depth-Anything-V2-Small-hf")
@@ -102,6 +117,18 @@ class Settings:
         Path.home() / ".robot-vision" / "orbslam3" / "ORBvoc.txt"))))
     vslam_enabled: bool = field(default_factory=lambda: _env("VS_VSLAM", "1") not in ("0", "false", "no"))
     camera_hfov_deg: float = field(default_factory=lambda: _env_f("VS_CAMERA_HFOV_DEG", 80.0))   # robot.yaml hfov_deg
+    # Optional pinhole+distortion calibration from chessboard (k1,k2,p1,p2) and fx,fy,cx,cy at calib_w x calib_h.
+    # Leave all zeros to fall back to pinhole from camera_hfov_deg.
+    camera_dist: tuple[float, float, float, float] = field(
+        default_factory=lambda: tuple(float(x) for x in (_env("VS_CAMERA_DIST", "0,0,0,0").split(",") + ["0"] * 4)[:4])
+    )
+    camera_intrinsics: tuple[float, float, float, float, int, int] = field(
+        default_factory=lambda: (
+            _env_f("VS_CAMERA_FX", 0.0), _env_f("VS_CAMERA_FY", 0.0),
+            _env_f("VS_CAMERA_CX", 0.0), _env_f("VS_CAMERA_CY", 0.0),
+            _env_i("VS_CAMERA_CALIB_W", 1920), _env_i("VS_CAMERA_CALIB_H", 1080),
+        )
+    )
     head_x_m: float = field(default_factory=lambda: _env_f("VS_HEAD_X_M", 0.0))         # robot.yaml pan_axis_x_m (gimbal at the centre)
     head_y_m: float = field(default_factory=lambda: _env_f("VS_HEAD_Y_M", -0.025))      # tof_from_right_m - width/2 (0.10 - 0.125)
     head_height_m: float = field(default_factory=lambda: _env_f("VS_HEAD_HEIGHT_M", 0.22))  # robot.yaml head_height_m

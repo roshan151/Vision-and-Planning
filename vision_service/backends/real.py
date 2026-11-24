@@ -49,12 +49,18 @@ def _resolve_device(requested: str) -> str:
 
 
 class YoloDetector:
-    def __init__(self, weights: str, imgsz: int, device: str) -> None:
-        from ultralytics import YOLO
-
+    def __init__(self, weights: str, imgsz: int, device: str,
+                 open_vocab_classes: list[str] | None = None) -> None:
         self._imgsz = imgsz
         self._device = device
-        self._model = YOLO(weights)
+        if "world" in weights.lower():
+            from ultralytics import YOLOWorld
+            self._model = YOLOWorld(weights)
+            if open_vocab_classes:
+                self._model.set_classes(list(open_vocab_classes))
+        else:
+            from ultralytics import YOLO
+            self._model = YOLO(weights)
         self._names: dict[int, str] = self._model.names
         self.model_version = f"{weights.removesuffix('.pt')}-{device}"
         # Warm the graph. The first inference on MPS compiles kernels and takes
@@ -64,7 +70,7 @@ class YoloDetector:
             np.zeros((imgsz, imgsz, 3), dtype=np.uint8),
             imgsz=imgsz, device=device, verbose=False,
         )
-        log.info("detector ready: %s on %s", weights, device)
+        log.info("detector ready: %s on %s (%d classes)", weights, device, len(self._names))
 
     def detect(self, image: np.ndarray, min_confidence: float) -> list[Detection]:
         results = self._model.predict(
@@ -231,7 +237,8 @@ class Dinov2PlantEncoder:
 def build() -> Backend:
     device = _resolve_device(settings.device)
     return Backend(
-        detector=YoloDetector(settings.detect_model, settings.detect_imgsz, device),
+        detector=YoloDetector(settings.detect_model, settings.detect_imgsz, device,
+                              open_vocab_classes=settings.open_vocab_classes),
         face=InsightFaceEncoder(settings.face_model, device),
         depth=DepthAnythingEstimator(settings.depth_model, device),
         kind="real",

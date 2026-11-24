@@ -355,8 +355,17 @@ with `bash deploy/install_orbslam3_macos.sh` (Homebrew deps, Pangolin, ORB-SLAM3
 Python bindings, then a check). Until then `/v1/nav/state` shows `"backend": "none"` and the map
 runs on the Pi's odometry. Settings: `VS_ORB_VOCAB`, `VS_VSLAM=0` to turn it off,
 `VS_CAMERA_HFOV_DEG`, `VS_HEAD_X_M` / `VS_HEAD_Y_M` / `VS_HEAD_HEIGHT_M` (match robot.yaml).
-Calibrate the camera for best results: the intrinsics written to `~/.robot-vision/vslam/camera.yaml`
-are estimated from the field of view. ORB-SLAM3 is GPLv3.
+For calibrated camera intrinsics and lens undistortion (used by both ORB-SLAM3 `camera.yaml` and
+`nav_api.project_detections`), set `VS_CAMERA_DIST="k1,k2,p1,p2"` and optionally
+`VS_CAMERA_FX`, `VS_CAMERA_FY`, `VS_CAMERA_CX`, `VS_CAMERA_CY` with `VS_CAMERA_CALIB_W` /
+`VS_CAMERA_CALIB_H` (defaults `1920` × `1080`, automatically scaled to stream frame size).
+For **open-vocabulary outdoor & indoor plant detection**, set `VS_DETECT_MODEL=yolov8s-worldv2.pt`
+(or `yolov8m-worldv2.pt`); `YoloDetector` automatically loads `YOLOWorld` with `VS_OPEN_VOCAB_CLASSES`
+and `explore_api.py` extracts plant boxes for any class in `VS_PLANT_CLASSES` (`potted plant`,
+`plant`, `shrub`, `bush`, `flower`, `garden bed`, `houseplant`, `fern`, `succulent`, `tree`).
+`install_orbslam3_macos.sh` verifies that the `getTrackedMappoints()` NULL/`isBad()` guard is
+applied before compiling the Python bindings. Semantic obstacle projection (`nav_api.OBSTACLES`)
+excludes `"suitcase"` to avoid false clutter hits near a followed person. ORB-SLAM3 is GPLv3.
 
 While a robot debug session is receiving uploads, everything this layer computes is saved beside
 them in `debug/<session>/nav/` (`nav_record.py`): `nav.jsonl` (SLAM status, every tracked frame,

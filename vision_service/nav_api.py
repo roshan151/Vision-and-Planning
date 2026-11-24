@@ -35,9 +35,9 @@ router = APIRouter()
 
 # COCO classes that stand on the floor and block a small robot (people are followed, not avoided). Left out:
 # what stands against a wall (refrigerator, oven, sink, toilet, tv: the ToF sees the wall anyway, and a white door
-# was a "refrigerator" 15 times in one doorway on Nov 19), animals (they move), and what feet and legs were taken
-# for (skateboard, sports ball, umbrella).
-OBSTACLES = {"chair", "couch", "bed", "dining table", "potted plant", "bench", "suitcase",
+# was a "refrigerator" 15 times in one doorway on Nov 19), animals (they move), and what feet, legs, and clutter
+# near the person were repeatedly mistaken for (skateboard, sports ball, umbrella, suitcase — 55-172 false hits/run).
+OBSTACLES = {"chair", "couch", "bed", "dining table", "potted plant", "bench",
              "backpack", "handbag", "bicycle", "motorcycle", "vase"}
 SEMANTIC_MIN_CONF = 0.68         # a guess is not an obstacle; doorposts must not be mistaken for furniture
 SEMANTIC_MAX_M = 1.8             # floor projection gets poor beyond this
@@ -48,7 +48,9 @@ class NavSession:
         self.map = GlobalMap(settings.slam_size_m, settings.slam_res_m)
         self.vslam = MonoVSLAM(settings.orb_vocab, settings.camera_hfov_deg,
                                (settings.head_x_m, settings.head_y_m, settings.head_height_m),
-                               enabled=settings.vslam_enabled)
+                               enabled=settings.vslam_enabled,
+                               dist=settings.camera_dist,
+                               intrinsics=settings.camera_intrinsics)
         self.plans = self.failed = 0
         self.last_plan_ms = 0.0
         self.record = NavRecorder(status=lambda: {"vslam": self.vslam.state(), "map": self.map.stats(),
@@ -74,6 +76,25 @@ def _inside(box, other) -> float:
     return w * h / area
 
 
+def _undistort_px(u: float, v: float, W: int, H: int, f: float) -> tuple[float, float]:
+    """Undistort image pixel (u, v) using calibrated camera_dist/intrinsics when configured."""
+    dist = settings.camera_dist
+    if not any(abs(c) > 1e-9 for c in dist):
+        return u, v
+    import cv2
+    import numpy as np
+    intr = settings.camera_intrinsics
+    if intr and len(intr) >= 6 and intr[0] > 0 and intr[1] > 0:
+        sx, sy = W / max(1.0, float(intr[4])), H / max(1.0, float(intr[5]))
+        fx, fy, cx, cy = intr[0] * sx, intr[1] * sy, intr[2] * sx, intr[3] * sy
+    else:
+        fx, fy, cx, cy = f, f, W / 2.0, H / 2.0
+    K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+    D = np.array(dist, dtype=np.float64)
+    pt = cv2.undistortPoints(np.array([[[u, v]]], dtype=np.float64), K, D, P=K)[0, 0]
+    return float(pt[0]), float(pt[1])
+
+
 def project_detections(nav: Optional[NavSession], dets, W: int, H: int, pan_deg: float, tilt_deg: float,
                        hfov_deg: float, camera_height_m: float, pose) -> int:
     """Floor-standing obstacles the detector found, onto the global map. tilt_deg: the head's real
@@ -91,13 +112,14 @@ def project_detections(nav: Optional[NavSession], dets, W: int, H: int, pan_deg:
             continue
         if any(_inside(d.bbox, p) > 0.4 for p in people):       # their feet, bag, a pet in their arms
             continue
-        below = math.radians(-tilt_deg) + math.atan2(d.bbox[3] - H / 2.0, f)
+        ux, uy = _undistort_px((d.bbox[0] + d.bbox[2]) / 2.0, d.bbox[3], W, H, f)
+        below = math.radians(-tilt_deg) + math.atan2(uy - H / 2.0, f)
         if below <= math.radians(2.0):
             continue
         dist = camera_height_m / math.tan(below)
         if dist > SEMANTIC_MAX_M:
             continue
-        bearing = math.radians(pan_deg) + math.atan2(W / 2.0 - (d.bbox[0] + d.bbox[2]) / 2.0, f)
+        bearing = math.radians(pan_deg) + math.atan2(W / 2.0 - ux, f)
         width = (d.bbox[2] - d.bbox[0]) / f * dist
         r = dist + width / 4.0                              # the box's bottom edge is its near side
         xy = apply(to_map, [(r * math.cos(bearing), r * math.sin(bearing))])[0]
