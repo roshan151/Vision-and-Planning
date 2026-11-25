@@ -59,6 +59,7 @@ import json
 import logging
 import math
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,10 +67,21 @@ from typing import Optional, Sequence
 
 import numpy as np
 
+try:
+    from .nav_map import distance_field as _distance_field
+    from .nav_map import door_approach as _door_approach
+    from .nav_map import theta_star as _theta_star
+except Exception:  # noqa: BLE001 — standalone import fallback
+    _distance_field = _door_approach = _theta_star = None
+
 log = logging.getLogger(__name__)
 
-L_FREE, L_OCC, L_MIN, L_MAX = -0.4, 0.85, -4.0, 4.0
-OCC_T, FREE_T = 0.5, -0.6     # one hit is enough to call a wall: scans are sparse
+# Single-ray free-space carving (L_FREE < FREE_T) prevents uncarved radial slivers
+# between ToF columns, while OCC_T + isolated-speckle filtering stops single stray
+# returns from sealing doorways. Two free rays cleanly erase a transient hit.
+L_FREE, L_OCC, L_MIN, L_MAX = -0.65, 0.85, -4.0, 4.0
+OCC_T, FREE_T = 0.70, -0.45
+TOF_WEDGE_RAD = math.radians(6.5)  # 8x8 ToF zone width (~7.5 deg): fill inter-ray slivers
 
 
 def wrap(a: float) -> float:
@@ -117,6 +129,10 @@ class OccupancyGrid:
     def occupied(self) -> np.ndarray:
         return self.logodds > OCC_T
 
+    def clean_occupied(self) -> np.ndarray:
+        """Occupied cells with isolated 1-cell stray ToF speckles removed."""
+        return _despeckle(self.occupied())
+
     def free(self) -> np.ndarray:
         return self.logodds < FREE_T
 
@@ -130,9 +146,12 @@ class OccupancyGrid:
             self.logodds[ij[:, 1], ij[:, 0]] = np.clip(
                 self.logodds[ij[:, 1], ij[:, 0]] + delta, L_MIN, L_MAX)
 
-    def integrate(self, origin_xy: np.ndarray, hits_xy: np.ndarray, max_range: float) -> None:
+    def integrate(self, origin_xy: np.ndarray, hits_xy: np.ndarray, max_range: float,
+                  wedge_rad: float = 0.0) -> None:
         """origin_xy: (n,2) sensor positions; hits_xy: (n,2) ray endpoints (world).
-        Rays shorter than max_range end in an obstacle."""
+        Rays shorter than max_range end in an obstacle. When wedge_rad > 0 (e.g.
+        8x8 ToF columns), free space is carved across the full angular wedge with
+        sub-cell angular density so zero inter-ray slivers survive at any range."""
         if not len(hits_xy):
             return
         free = []
@@ -143,9 +162,23 @@ class OccupancyGrid:
             length = float(np.hypot(*d))
             if length < 1e-6:
                 continue
-            ts = np.arange(0.0, max(0.0, length - self.res), step)
-            free.append(self.cells(o + np.outer(ts / length, d)))
-            if length < max_range - 1e-6:
+            carve_len = min(length, max_range) if max_range > 0 else length
+            base_ang = math.atan2(d[1], d[0])
+            if wedge_rad > 1e-4:
+                n_sub = max(3, int(math.ceil(carve_len * wedge_rad / (self.res * 0.85))) + 1)
+                angs = base_ang + np.linspace(-0.5 * wedge_rad, 0.5 * wedge_rad, n_sub)
+                stop_len = max(0.0, carve_len - (1.4 * self.res if max_range > 0 else 0.0))
+                if stop_len > 1e-6:
+                    ts = np.arange(0.0, stop_len, step)
+                    dirs = np.stack([np.cos(angs), np.sin(angs)], axis=1)        # (n_sub, 2)
+                    pts = o[None, None, :] + ts[:, None, None] * dirs[None, :, :]  # (nt, n_sub, 2)
+                    free.append(self.cells(pts.reshape(-1, 2)))
+            else:
+                stop_len = max(0.0, carve_len - (self.res if max_range > 0 else 0.0))
+                if stop_len > 1e-6:
+                    ts = np.arange(0.0, stop_len, step)
+                    free.append(self.cells(o + np.outer(ts / length, d)))
+            if max_range > 0 and length < max_range - 1e-6:
                 occ.append(self.cells(h[None, :]))
         if free:
             fc = np.concatenate(free)
@@ -171,6 +204,19 @@ class OccupancyGrid:
     def mark_occupied(self, xy: np.ndarray) -> None:
         if len(xy):
             self._bump(self.cells(np.asarray(xy, float).reshape(-1, 2)), L_OCC * 2)
+
+
+def _despeckle(mask: np.ndarray) -> np.ndarray:
+    """Drop isolated 1-cell speckles (occupied cells with zero occupied 8-neighbours).
+    Real walls/furniture legs have at least one adjacent cell; a lone stray ToF reading
+    otherwise inflates to block a 0.5 m doorway."""
+    if not mask.any():
+        return mask
+    p = np.pad(mask.astype(np.uint8), 1)
+    nbrs = (p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:]
+            + p[1:-1, :-2] + p[1:-1, 2:]
+            + p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:])
+    return mask & (nbrs > 0)
 
 
 def _blur(mask: np.ndarray, sigma_cells: float) -> np.ndarray:
@@ -201,7 +247,7 @@ def _dilate(mask: np.ndarray, radius_cells: int) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
-# scan matching
+# scan matching & pose-graph optimization
 # --------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -211,38 +257,225 @@ class MatchResult:
     accepted: bool
 
 
+def _refine_subcell(grid: OccupancyGrid, field_: np.ndarray, pose: tuple,
+                    pts_local: np.ndarray, prior: Sequence[float],
+                    xy_window: float, th_window: float, prior_weight: float,
+                    iters: int = 6) -> tuple:
+    """Damped Gauss-Newton sub-cell refinement maximizing bilinearly-interpolated
+    likelihood `field_(T(pose) @ pts_local)` minus the odometry prior penalty."""
+    n = grid.n
+    gy, gx = np.gradient(field_)
+    x, y, th = float(pose[0]), float(pose[1]), float(pose[2])
+    px, py = pts_local[:, 0], pts_local[:, 1]
+    inv_res = 1.0 / grid.res
+    w_xy = 2.0 * prior_weight / max(xy_window * xy_window, 1e-6)
+    w_th = 2.0 * prior_weight / max(th_window * th_window, 1e-6)
+
+    def eval_obj(cx: float, cy: float, cth: float) -> tuple:
+        c, s = math.cos(cth), math.sin(cth)
+        wx = cx + c * px - s * py
+        wy = cy + s * px + c * py
+        fx = (wx - grid.origin) * inv_res - 0.5
+        fy = (wy - grid.origin) * inv_res - 0.5
+        ok = (fx >= 0.0) & (fx < n - 1.001) & (fy >= 0.0) & (fy < n - 1.001)
+        if ok.sum() < 10:
+            return -1e9, 0.0, None
+        ix = np.floor(fx[ok]).astype(np.int64)
+        iy = np.floor(fy[ok]).astype(np.int64)
+        ux, uy = fx[ok] - ix, fy[ok] - iy
+        v = ((1 - ux) * (1 - uy) * field_[iy, ix]
+             + ux * (1 - uy) * field_[iy, ix + 1]
+             + (1 - ux) * uy * field_[iy + 1, ix]
+             + ux * uy * field_[iy + 1, ix + 1])
+        score = float(v.sum()) / len(pts_local)
+        pen = prior_weight * (((cx - prior[0]) ** 2 + (cy - prior[1]) ** 2) / max(xy_window ** 2, 1e-6)
+                              + (wrap(cth - prior[2]) / max(th_window, 1e-6)) ** 2)
+        return score - pen, score, (ok, ix, iy, ux, uy, v, c, s)
+
+    best_obj, best_score, cache = eval_obj(x, y, th)
+    if cache is None:
+        return pose, 0.0
+    for _ in range(iters):
+        ok, ix, iy, ux, uy, v, c, s = cache
+        # Interpolated gradients in world units (per metre)
+        dfx = (((1 - ux) * (1 - uy) * gx[iy, ix] + ux * (1 - uy) * gx[iy, ix + 1]
+                + (1 - ux) * uy * gx[iy + 1, ix] + ux * uy * gx[iy + 1, ix + 1]) * inv_res)
+        dfy = (((1 - ux) * (1 - uy) * gy[iy, ix] + ux * (1 - uy) * gy[iy, ix + 1]
+                + (1 - ux) * uy * gy[iy + 1, ix] + ux * uy * gy[iy + 1, ix + 1]) * inv_res)
+        # Residual r_i = 1 - v_i; minimize 0.5 * mean(r_i^2) + prior
+        r = 1.0 - v
+        dwx_dth = -s * px[ok] - c * py[ok]
+        dwy_dth = c * px[ok] - s * py[ok]
+        J = np.stack([-dfx, -dfy, -(dfx * dwx_dth + dfy * dwy_dth)], axis=1)
+        inv_m = 1.0 / len(pts_local)
+        H = (J.T @ J) * inv_m + np.diag([w_xy + 0.5, w_xy + 0.5, w_th + 1.0])
+        g = (J.T @ r) * inv_m + np.array([
+            w_xy * (x - prior[0]),
+            w_xy * (y - prior[1]),
+            w_th * wrap(th - prior[2]),
+        ])
+        try:
+            step = -np.linalg.solve(H, g)
+        except np.linalg.LinAlgError:
+            break
+        if np.hypot(step[0], step[1]) > 0.08 or abs(step[2]) > math.radians(4.0):
+            scale = min(0.08 / max(np.hypot(step[0], step[1]), 1e-9),
+                        math.radians(4.0) / max(abs(step[2]), 1e-9), 1.0)
+            step *= scale
+        nx_, ny_, nth_ = x + float(step[0]), y + float(step[1]), wrap(th + float(step[2]))
+        if math.hypot(nx_ - prior[0], ny_ - prior[1]) > xy_window * 1.15 or abs(wrap(nth_ - prior[2])) > th_window * 1.15:
+            break
+        obj, sc, ncache = eval_obj(nx_, ny_, nth_)
+        if ncache is None or obj < best_obj + 1e-5:
+            break
+        x, y, th, best_obj, best_score, cache = nx_, ny_, nth_, obj, sc, ncache
+        if np.hypot(step[0], step[1]) < 1e-3 and abs(step[2]) < math.radians(0.05):
+            break
+    return (x, y, th), best_score
+
+
 def match_scan(grid: OccupancyGrid, field_: np.ndarray, prior: Sequence[float],
-               pts_local: np.ndarray, xy_window: float = 0.4, th_window: float = math.radians(12),
+               pts_local: np.ndarray, xy_window: float = 0.5, th_window: float = math.radians(15),
                th_step: float = math.radians(1), min_score: float = 0.35,
                prior_weight: float = 0.08) -> MatchResult:
-    """Correlative search around `prior` for the pose that puts the scan's
-    endpoints on the walls already in the map.
+    """Coarse-to-fine correlative search + Gauss-Newton sub-cell refinement around
+    `prior` for the pose that puts the scan's endpoints on the walls already in the map.
 
-    `field_` is the blurred wall map (see `_blur`); a small penalty on distance
-    from the odometry prior keeps symmetric rooms from pulling the pose to a
-    look-alike spot.
+    `field_` is the blurred wall map (see `_blur`); a small penalty on distance from
+    the odometry prior keeps symmetric rooms from pulling the pose to a look-alike spot.
     """
     if len(pts_local) < 15 or field_.max() <= 0:
         return MatchResult(tuple(prior), 0.0, False)
     k = int(round(xy_window / grid.res))
-    offs = np.stack(np.meshgrid(np.arange(-k, k + 1), np.arange(-k, k + 1)), -1).reshape(-1, 2)
-    best = (-1e9, 0.0, tuple(prior))
-    for dth in np.arange(-th_window, th_window + 1e-9, th_step):
-        pose = (prior[0], prior[1], wrap(prior[2] + dth))
-        base = grid.cells(transform(pose, pts_local))                 # (n,2)
-        idx = base[None, :, :] + offs[:, None, :]                      # (m,n,2)
-        ok = grid.inside(idx)
-        ix = np.clip(idx[..., 0], 0, grid.n - 1)
-        iy = np.clip(idx[..., 1], 0, grid.n - 1)
-        vals = np.where(ok, field_[iy, ix], 0.0).mean(axis=1)          # (m,)
-        pen = prior_weight * ((np.hypot(offs[:, 0], offs[:, 1]) * grid.res / xy_window) ** 2
-                              + (dth / th_window) ** 2)
-        j = int(np.argmax(vals - pen))
-        if vals[j] - pen[j] > best[0]:
-            dx, dy = offs[j] * grid.res
-            best = (vals[j] - pen[j], float(vals[j]), (prior[0] + dx, prior[1] + dy, pose[2]))
+
+    def _search(center_pose, xy_cells: np.ndarray, th_vals: np.ndarray):
+        top = []  # keep top-3 peaks (obj, score, pose)
+        for dth in th_vals:
+            pose = (center_pose[0], center_pose[1], wrap(center_pose[2] + dth))
+            base = grid.cells(transform(pose, pts_local))                 # (n,2)
+            idx = base[None, :, :] + xy_cells[:, None, :]                 # (m,n,2)
+            ok = grid.inside(idx)
+            ix = np.clip(idx[..., 0], 0, grid.n - 1)
+            iy = np.clip(idx[..., 1], 0, grid.n - 1)
+            vals = np.where(ok, field_[iy, ix], 0.0).mean(axis=1)         # (m,)
+            dx_w = (center_pose[0] - prior[0]) + xy_cells[:, 0] * grid.res
+            dy_w = (center_pose[1] - prior[1]) + xy_cells[:, 1] * grid.res
+            dth_w = wrap(pose[2] - prior[2])
+            pen = prior_weight * ((np.hypot(dx_w, dy_w) / max(xy_window, 1e-6)) ** 2
+                                  + (dth_w / max(th_window, 1e-6)) ** 2)
+            objs = vals - pen
+            j = int(np.argmax(objs))
+            cand = (float(objs[j]), float(vals[j]),
+                    (center_pose[0] + float(xy_cells[j, 0]) * grid.res,
+                     center_pose[1] + float(xy_cells[j, 1]) * grid.res,
+                     pose[2]))
+            top.append(cand)
+        top.sort(key=lambda t: -t[0])
+        return top[:3]
+
+    # Coarse stage when search window is large (e.g. loop closure), then fine stage
+    if k > 10:
+        c_step = max(2, k // 8)
+        c_rng = np.arange(-k, k + 1, c_step)
+        c_offs = np.stack(np.meshgrid(c_rng, c_rng), -1).reshape(-1, 2)
+        c_th = np.arange(-th_window, th_window + 1e-9, max(th_step * 3.0, math.radians(3.0)))
+        seeds = _search(tuple(prior), c_offs, c_th)
+        f_rng = np.arange(-c_step, c_step + 1)
+        f_offs = np.stack(np.meshgrid(f_rng, f_rng), -1).reshape(-1, 2)
+        f_th = np.arange(-max(th_step * 3.0, math.radians(3.0)),
+                         max(th_step * 3.0, math.radians(3.0)) + 1e-9, th_step)
+        best = (-1e9, 0.0, tuple(prior))
+        for _, _, seed_pose in seeds:
+            cand = _search(seed_pose, f_offs, f_th)[0]
+            if cand[0] > best[0]:
+                best = cand
+    else:
+        offs = np.stack(np.meshgrid(np.arange(-k, k + 1), np.arange(-k, k + 1)), -1).reshape(-1, 2)
+        th_vals = np.arange(-th_window, th_window + 1e-9, th_step)
+        best = _search(tuple(prior), offs, th_vals)[0]
+
     _, score, pose = best
-    return MatchResult(pose, round(score, 3), score >= min_score)
+    if score >= min_score * 0.85:
+        pose_ref, score_ref = _refine_subcell(grid, field_, pose, pts_local, prior,
+                                              xy_window, th_window, prior_weight)
+        if score_ref >= score:
+            pose, score = pose_ref, score_ref
+    return MatchResult(pose, round(float(score), 3), score >= min_score)
+
+
+@dataclass(frozen=True)
+class PoseEdge:
+    """Relative SE(2) constraint from node i to node j in node i's local frame."""
+    i: int
+    j: int
+    z: tuple              # (dx, dy, dth) in frame i
+    w_xy: float = 25.0    # information weight (1 / sigma_m^2)
+    w_th: float = 100.0   # information weight (1 / sigma_rad^2)
+    huber: float = 0.0    # >0 enables Huber robust weighting (for loop edges)
+
+
+def optimize_pose_graph(poses: Sequence[tuple], edges: Sequence[PoseEdge],
+                        iters: int = 12, damping: float = 1e-3) -> list[tuple]:
+    """Pure-NumPy 2-D SE(2) pose-graph Gauss-Newton optimizer with node 0 anchored
+    and optional Huber loss on loop-closure edges. Solves 100-node graphs in <10 ms."""
+    n = len(poses)
+    if n <= 1 or not edges:
+        return [tuple(p) for p in poses]
+    x = np.array([[float(p[0]), float(p[1]), float(p[2])] for p in poses], dtype=np.float64)
+    for _ in range(iters):
+        H = np.zeros((3 * n, 3 * n), dtype=np.float64)
+        b = np.zeros(3 * n, dtype=np.float64)
+        # Strong anchor on node 0 so the map frame stays fixed at initial_pose
+        H[0:3, 0:3] += np.diag([1e9, 1e9, 1e9])
+        for e in edges:
+            if not (0 <= e.i < n and 0 <= e.j < n) or e.i == e.j:
+                continue
+            xi, yi, thi = x[e.i]
+            xj, yj, thj = x[e.j]
+            ci, si = math.cos(thi), math.sin(thi)
+            dx, dy = xj - xi, yj - yi
+            # Predicted relative pose in frame i minus measurement z
+            ex = ci * dx + si * dy - e.z[0]
+            ey = -si * dx + ci * dy - e.z[1]
+            eth = wrap(thj - thi - e.z[2])
+            err = np.array([ex, ey, eth], dtype=np.float64)
+            W = np.array([e.w_xy, e.w_xy, e.w_th], dtype=np.float64)
+            if e.huber > 0.0:
+                r_norm = math.sqrt(float((W * err * err).sum()))
+                if r_norm > e.huber:
+                    W = W * (e.huber / r_norm)
+            Ji = np.array([
+                [-ci, -si, -si * dx + ci * dy],
+                [si, -ci, -ci * dx - si * dy],
+                [0.0, 0.0, -1.0],
+            ], dtype=np.float64)
+            Jj = np.array([
+                [ci, si, 0.0],
+                [-si, ci, 0.0],
+                [0.0, 0.0, 1.0],
+            ], dtype=np.float64)
+            JiW = Ji.T * W
+            JjW = Jj.T * W
+            si3, sj3 = 3 * e.i, 3 * e.j
+            H[si3:si3 + 3, si3:si3 + 3] += JiW @ Ji
+            H[si3:si3 + 3, sj3:sj3 + 3] += JiW @ Jj
+            H[sj3:sj3 + 3, si3:si3 + 3] += JjW @ Ji
+            H[sj3:sj3 + 3, sj3:sj3 + 3] += JjW @ Jj
+            b[si3:si3 + 3] += JiW @ err
+            b[sj3:sj3 + 3] += JjW @ err
+        H += np.eye(3 * n) * damping
+        try:
+            delta = -np.linalg.solve(H, b).reshape(n, 3)
+        except np.linalg.LinAlgError:
+            break
+        delta[0] = 0.0
+        x[:, 0] += delta[:, 0]
+        x[:, 1] += delta[:, 1]
+        for k in range(n):
+            x[k, 2] = wrap(float(x[k, 2] + delta[k, 2]))
+        if float(np.max(np.abs(delta))) < 1e-4:
+            break
+    return [(float(p[0]), float(p[1]), float(p[2])) for p in x]
 
 
 # --------------------------------------------------------------------------
@@ -253,7 +486,7 @@ _N8 = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)]
 
 
 def traversable(grid: OccupancyGrid, robot_radius: float) -> np.ndarray:
-    blocked = _dilate(grid.occupied(), int(math.ceil(robot_radius / grid.res)))
+    blocked = _dilate(grid.clean_occupied(), int(math.ceil(robot_radius / grid.res)))
     return grid.free() & ~blocked
 
 
@@ -441,19 +674,22 @@ def in_scope(start: Sequence[float], radius_m: Optional[float], no_behind: bool,
 class SlamConfig:
     size_m: float = 24.0
     res: float = 0.05
-    max_range: float = 7.5          # TF-Luna is good to ~8 m indoors
+    max_range: float = 3.8          # 8x8 ToF max reliable range (~4 m); rays beyond carve free space only
+    wedge_rad: float = TOF_WEDGE_RAD  # angular wedge carve per ToF ray (0 disables for narrow-beam lidar)
     robot_radius: float = 0.18
     clearance: float = 0.05         # extra margin on top of the radius
     min_frontier_cells: int = 6
     max_cloud_points: int = 400_000   # 3-D points kept (one per 5 cm cube), oldest dropped first
     pref_clearance: float = 0.15    # paths keep this much more room where the map allows it
     loop_closure: bool = True
-    loop_gap: int = 5               # keyframes between this one and an old one before it is a loop
-    loop_radius: float = 1.5        # m: an old keyframe this near counts as a revisit
-    loop_min_travel: float = 3.0    # m driven since that old keyframe
-    loop_window_m: float = 0.8      # the loop match searches this far...
-    loop_window_deg: float = 20.0   # ...and this far round
-    loop_min_score: float = 0.5     # and needs at least this good a fit (0..1)
+    loop_gap: int = 4               # keyframes between this one and an old one before it is a loop
+    loop_radius: float = 2.5        # m: an old keyframe this near counts as a revisit
+    loop_min_travel: float = 2.5    # m driven since that old keyframe
+    loop_window_m: float = 1.5      # the loop match searches this far...
+    loop_window_deg: float = 35.0   # ...and this far round
+    loop_min_score: float = 0.45    # and needs at least this good a fit (0..1)
+    unreachable_ttl_s: float = 60.0 # cooldown before retrying a frontier LocalNav could not reach
+    unreachable_radius_m: float = 0.65
 
 
 @dataclass
@@ -479,6 +715,10 @@ class SlamSession:
         self.goal: Optional[dict] = None
         self._new_layers()
         self._kf_data: dict = {}                   # kf_id -> its readings in base_link, for rebuilds
+        self._sub_scans: dict[int, list] = {}      # kf_id -> [(rel_pose_from_kf, data), ...] continuous scans
+        self._edges: list[PoseEdge] = []           # pose-graph constraints (odom, match, loop)
+        self._unreachable: list[tuple[float, float, float]] = []   # (x, y, expiry_monotonic)
+        self._prev_goal_xy: Optional[tuple] = None
         self._base = None                          # the loaded map a rebuild starts from (None: empty)
 
     # --- helpers --------------------------------------------------------
@@ -497,25 +737,57 @@ class SlamSession:
         ij = ij[self.grid.inside(ij)]
         layer[ij[:, 1], ij[:, 0]] = True
 
+    def _hard_obstacles(self) -> np.ndarray:
+        """Despeckled walls plus sticky low obstacles and drop-offs."""
+        return self.grid.clean_occupied() | self.low | self.drops
+
     def _trav(self, extra: float = 0.0, unknown: bool = False) -> np.ndarray:
         """Where the robot's centre may go. unknown: also floor not seen yet (not only seen free), as
-        long as nothing known is within reach; the Pi probes the floor before every step of such a leg."""
+        long as nothing known is within reach."""
         r = self.config.robot_radius + self.config.clearance + extra
-        nogo = _dilate(self.low | self.drops, int(math.ceil(r / self.grid.res)))
+        blocked = _dilate(self._hard_obstacles(), int(math.ceil(r / self.grid.res)))
         if unknown:
-            return ~_dilate(self.grid.occupied(), int(math.ceil(r / self.grid.res))) & ~nogo
-        return traversable(self.grid, r) & ~nogo
+            return ~blocked
+        return self.grid.free() & ~blocked
+
+    def _plan_theta(self, start_xy, goal_xy, trav_yx: np.ndarray) -> Optional[list]:
+        """Any-angle Theta* with distance-field clearance preference and doorway alignment
+        (borrowed from nav_map.py), falling back to BFS+shortcut if nav_map is unavailable."""
+        s = _start_cell(self.grid, trav_yx, start_xy)
+        g = _start_cell(self.grid, trav_yx, goal_xy)
+        if s is None or g is None:
+            return None
+        if _theta_star is None or _distance_field is None:
+            return plan_path(self.grid, trav_yx, start_xy, goal_xy)
+        # Window around start and goal for fast planning on a 480x480 grid
+        b = int(3.0 / self.grid.res)
+        x0 = max(0, min(s[0], g[0]) - b)
+        x1 = min(self.grid.n, max(s[0], g[0]) + b + 1)
+        y0 = max(0, min(s[1], g[1]) - b)
+        y1 = min(self.grid.n, max(s[1], g[1]) + b + 1)
+        # nav_map uses [ix, iy] indexing; slam.py uses [iy, ix] -> transpose
+        free_xy = trav_yx[y0:y1, x0:x1].T
+        occ_xy = self._hard_obstacles()[y0:y1, x0:x1].T
+        ls = (s[0] - x0, s[1] - y0)
+        lg = (g[0] - x0, g[1] - y0)
+        r_min = self.config.robot_radius + self.config.clearance
+        field_xy = _distance_field(occ_xy, self.grid.res, cap_m=r_min + 0.5)
+        penalty = np.clip((r_min + 0.35 - field_xy) / 0.35, 0.0, 1.0) * 2.0
+        cells = _theta_star(free_xy, ls, lg, penalty=penalty)
+        if cells is None:
+            return plan_path(self.grid, trav_yx, start_xy, goal_xy)
+        if _door_approach is not None:
+            cells, _ = _door_approach(cells, occ_xy, field_xy, free_xy, r_min, self.grid.res)
+        return [tuple(map(float, self.grid.world(np.array([c[0] + x0, c[1] + y0])))) for c in cells]
 
     def _plan(self, start_xy, goal_xy) -> Optional[list]:
-        """A path with room to spare where the map allows (pref_clearance), else the tightest."""
+        """Any-angle Theta* with doorway approach; prefers roomy clearance, falls back to tightest."""
         if self.config.pref_clearance > 0:
-            p = plan_path(self.grid, self._trav(self.config.pref_clearance), start_xy, goal_xy)
+            p = self._plan_theta(start_xy, goal_xy, self._trav(self.config.pref_clearance))
             if p is not None:
                 return p
-        p = plan_path(self.grid, self._trav(), start_xy, goal_xy)
-        # Last: through floor not seen yet (round the far side of a plant, to one across the room).
-        # Nov 23: every viewpoint but the one on the robot's side was refused, and plants 2 m off got none.
-        return p if p is not None else plan_path(self.grid, self._trav(unknown=True), start_xy, goal_xy)
+        p = self._plan_theta(start_xy, goal_xy, self._trav())
+        return p if p is not None else self._plan_theta(start_xy, goal_xy, self._trav(unknown=True))
 
     def clearances(self, path: Sequence, reach: float = 1.0) -> list:
         """For each path point, the nearest mapped wall, low obstacle or drop (m, capped at
@@ -525,7 +797,7 @@ class SlamSession:
 
     def _clearances(self, path: Sequence, reach: float = 1.0) -> list:
         g = self.grid
-        hard = g.occupied() | self.low | self.drops
+        hard = self._hard_obstacles()
         k = int(math.ceil(reach / g.res))
 
         def near(xy) -> float:
@@ -544,20 +816,19 @@ class SlamSession:
         return out
 
     def _integrate(self, pose: tuple, d: dict) -> None:
-        """Fold one keyframe's readings (base_link, see add_keyframe) into the map at `pose`."""
+        """Fold one scan's readings (base_link, see add_keyframe) into the map at `pose`."""
         cfg = self.config
         pts, sensor_xy = d["pts"], d["sensor_xy"]
         world = transform(pose, pts) if len(pts) else pts
         origin = transform(pose, np.array([sensor_xy], float))
-        self.grid.integrate(np.repeat(origin, len(world), 0), world, cfg.max_range)
+        self.grid.integrate(np.repeat(origin, len(world), 0), world, cfg.max_range, wedge_rad=cfg.wedge_rad)
         self.grid.mark_free_disc(pose, cfg.robot_radius)
         if len(d["obstacles"]):
             self.grid.mark_occupied(transform(pose, d["obstacles"]))
         if len(d["clear"]):
-            # max_range 0: no ray "ends in an obstacle", so these only carve free space.
-            # Twice: the floor was SEEN there, which is worth more than a beam passing over.
-            for _ in range(2):
-                self.grid.integrate(np.repeat(origin, len(d["clear"]), 0), transform(pose, d["clear"]), 0.0)
+            # max_range 0: no ray ends in an obstacle, so these only carve free space.
+            self.grid.integrate(np.repeat(origin, len(d["clear"]), 0), transform(pose, d["clear"]),
+                                0.0, wedge_rad=cfg.wedge_rad)
         for layer, pts_ in ((self.low, d["low"]), (self.drops, d["drops"])):
             if len(pts_):
                 self._mark(layer, transform(pose, pts_))
@@ -568,19 +839,25 @@ class SlamSession:
             _, first = np.unique(np.round(both / 0.05).astype(np.int32), axis=0, return_index=True)
             self.cloud = both[np.sort(first)][-cfg.max_cloud_points:]
 
-    def _submap(self, ids) -> OccupancyGrid:
-        """Walls only, from just these keyframes: what a scan is matched against in a loop check."""
+    def _submap(self, ids, include_sub: bool = True) -> OccupancyGrid:
+        """Walls only, from these keyframes (and optionally their attached continuous sub-scans)."""
         g = OccupancyGrid(self.config.size_m, self.config.res)
         for i in ids:
             kf, d = self.keyframes[i], self._kf_data.get(i)
-            if d is None or not len(d["pts"]):
-                continue
-            origin = transform(kf.pose, np.array([d["sensor_xy"]], float))
-            g.integrate(np.repeat(origin, len(d["pts"]), 0), transform(kf.pose, d["pts"]), self.config.max_range)
+            if d is not None and len(d["pts"]):
+                origin = transform(kf.pose, np.array([d["sensor_xy"]], float))
+                g.integrate(np.repeat(origin, len(d["pts"]), 0), transform(kf.pose, d["pts"]), self.config.max_range)
+            if include_sub:
+                for rel, sd in self._sub_scans.get(i, ()):
+                    if len(sd["pts"]):
+                        sp = compose(kf.pose, rel)
+                        origin = transform(sp, np.array([sd["sensor_xy"]], float))
+                        g.integrate(np.repeat(origin, len(sd["pts"]), 0), transform(sp, sd["pts"]), self.config.max_range)
         return g
 
     def _rebuild(self) -> None:
-        """The map again, from the loaded base (if any) and every keyframe at its pose now."""
+        """Rebuild the entire map cleanly from the loaded base, every keyframe at its
+        pose-graph-optimized pose, and all continuous sub-scans attached to each keyframe."""
         self.grid = OccupancyGrid(self.config.size_m, self.config.res)
         self._new_layers()
         if self._base is not None:
@@ -588,10 +865,12 @@ class SlamSession:
         for kf in self.keyframes:
             if kf.kf_id in self._kf_data:
                 self._integrate(kf.pose, self._kf_data[kf.kf_id])
+            for rel, sd in self._sub_scans.get(kf.kf_id, ()):
+                self._integrate(compose(kf.pose, rel), sd)
 
     def _close_loop(self, prior: tuple, pts_hit: np.ndarray) -> Optional[dict]:
-        """See the module docstring. Corrects the keyframes in place and returns what it did,
-        or None (no loop here, or the old map does not agree well enough)."""
+        """Detect a revisit against non-adjacent old keyframes, verify by coarse-to-fine
+        correlative + sub-cell scan match, and return the verified loop constraint."""
         cfg, k = self.config, len(self.keyframes)
         if not cfg.loop_closure or k <= cfg.loop_gap or len(pts_hit) < 15:
             return None
@@ -605,24 +884,21 @@ class SlamSession:
         if sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(chain, chain[1:])) < cfg.loop_min_travel:
             return None
         recent = self._submap(range(max(anchor + 1, k - 4), k))
-        mr = match_scan(recent, _blur(recent.occupied(), 2.0), prior, pts_hit)
+        mr = match_scan(recent, _blur(recent.clean_occupied(), 2.0), prior, pts_hit)
         here = mr.pose if mr.accepted else prior
         past = self._submap(old)
-        mo = match_scan(past, _blur(past.occupied(), 2.0), here, pts_hit, xy_window=cfg.loop_window_m,
+        mo = match_scan(past, _blur(past.clean_occupied(), 2.0), here, pts_hit, xy_window=cfg.loop_window_m,
                         th_window=math.radians(cfg.loop_window_deg), min_score=cfg.loop_min_score)
         if not mo.accepted:
             return None
-        fix = compose(mo.pose, between(here, (0.0, 0.0, 0.0)))    # map-frame correction: fix ⊕ here = mo.pose
-        if math.hypot(fix[0], fix[1]) < 0.05 and abs(fix[2]) < math.radians(1.0) and \
-                math.hypot(mo.pose[0] - here[0], mo.pose[1] - here[1]) < 0.05:
-            return None                                           # already consistent
-        n = k - anchor
-        for kf in self.keyframes[anchor + 1:]:
-            w = (kf.kf_id - anchor) / n
-            kf.pose = compose((w * fix[0], w * fix[1], w * fix[2]), kf.pose)
-        self._rebuild()
+        corr_m = math.hypot(mo.pose[0] - here[0], mo.pose[1] - here[1])
+        corr_deg = abs(math.degrees(wrap(mo.pose[2] - here[2])))
+        if corr_m < 0.03 and corr_deg < 0.8:
+            return None                                           # already tightly consistent
+        # Measure relative pose from anchor to current node in anchor's local frame
+        z_loop = between(self.keyframes[anchor].pose, mo.pose)
         return {"closed": True, "with_kf": anchor, "score": mo.score, "pose": mo.pose,
-                "correction_m": round(math.hypot(mo.pose[0] - here[0], mo.pose[1] - here[1]), 3),
+                "z_loop": z_loop, "correction_m": round(corr_m, 3),
                 "correction_deg": round(math.degrees(wrap(mo.pose[2] - here[2])), 2)}
 
     def map_to_odom(self) -> tuple:
@@ -634,6 +910,23 @@ class SlamSession:
 
     def pose_of(self, odom: Sequence[float]) -> tuple:
         return compose(self.map_to_odom(), tuple(odom))
+
+    def _pack_scan(self, rays: Sequence, sensor_xy, obstacles: Sequence = (),
+                   low: Sequence = (), drops: Sequence = (), clear: Sequence = (),
+                   cloud: Sequence = ()) -> tuple:
+        cfg = self.config
+        r = np.array([[float(b), float(d)] for b, d in rays if d is not None and d > 0], float).reshape(-1, 2)
+        pts = np.stack([sensor_xy[0] + r[:, 1] * np.cos(r[:, 0]),
+                        sensor_xy[1] + r[:, 1] * np.sin(r[:, 0])], 1) if len(r) else np.zeros((0, 2))
+        hit = r[:, 1] < cfg.max_range if len(r) else np.zeros(0, bool)
+        c = np.asarray(clear, float).reshape(-1, 2)
+        data = {"pts": pts, "sensor_xy": tuple(map(float, sensor_xy)),
+                "obstacles": np.asarray(obstacles, float).reshape(-1, 2),
+                "clear": np.stack([sensor_xy[0] + c[:, 1] * np.cos(c[:, 0]),
+                                   sensor_xy[1] + c[:, 1] * np.sin(c[:, 0])], 1) if len(c) else np.zeros((0, 2)),
+                "low": np.asarray(low, float).reshape(-1, 2), "drops": np.asarray(drops, float).reshape(-1, 2),
+                "cloud": np.asarray(cloud, np.float32).reshape(-1, 3)}
+        return data, pts[hit]
 
     # --- api ------------------------------------------------------------
 
@@ -651,9 +944,54 @@ class SlamSession:
                           self.cloud.copy()) if keep_map else None
             self.keyframes = []
             self._kf_data = {}
+            self._sub_scans = {}
+            self._edges = []
+            self._unreachable = []
+            self._prev_goal_xy = None
             self.initial_pose = tuple(map(float, initial_pose))
             self.scope = (radius_m, bool(no_behind))
             self.goal = None
+
+    def add_scan(self, odom: Sequence[float], rays: Sequence, sensor_xy=(0.0, 0.0),
+                 obstacles: Sequence = (), low: Sequence = (), drops: Sequence = (),
+                 clear: Sequence = (), cloud: Sequence = (), plan: bool = False) -> dict:
+        """Fold a lightweight continuous ToF scan taken while driving between anchor keyframes.
+        Attaches to the latest anchor keyframe so future loop closures re-align it too."""
+        odom = tuple(map(float, odom))
+        data, _ = self._pack_scan(rays, sensor_xy, obstacles, low, drops, clear, cloud)
+        with self.lock:
+            if not self.keyframes:
+                # No anchor yet: promote to keyframe 0 so continuous streaming can even bootstrap a map
+                return self._add_keyframe_locked(odom, data, data["pts"], plan=plan)
+            kf = self.keyframes[-1]
+            rel = between(kf.odom, odom)
+            pose = compose(kf.pose, rel)
+            self._integrate(pose, data)
+            self._sub_scans.setdefault(kf.kf_id, []).append((rel, data))
+            out = {
+                "kf_id": kf.kf_id,
+                "pose": [round(v, 4) for v in pose],
+                "map_to_odom": [round(v, 4) for v in self.map_to_odom()],
+                "explored_m2": round(float(self.grid.free().sum()) * self.grid.res ** 2, 2),
+            }
+            if plan:
+                out.update(self._next_goal(pose))
+            return out
+
+    def mark_unreachable(self, xy: Sequence[float], ttl_s: Optional[float] = None,
+                         pose: Optional[Sequence[float]] = None) -> dict:
+        """Blacklist a frontier area temporarily after LocalNav fails to reach it, and
+        return the next-best frontier from `pose` (or the latest keyframe pose)."""
+        ttl = self.config.unreachable_ttl_s if ttl_s is None else float(ttl_s)
+        with self.lock:
+            now = time.monotonic()
+            self._unreachable = [u for u in self._unreachable if u[2] > now]
+            self._unreachable.append((float(xy[0]), float(xy[1]), now + ttl))
+            if self._prev_goal_xy is not None and math.hypot(self._prev_goal_xy[0] - xy[0], self._prev_goal_xy[1] - xy[1]) < 0.6:
+                self._prev_goal_xy = None
+            cur = tuple(map(float, pose)) if pose is not None else (
+                self.keyframes[-1].pose if self.keyframes else self.initial_pose)
+            return self._next_goal(cur)
 
     def add_keyframe(self, odom: Sequence[float], rays: Sequence, sensor_xy=(0.0, 0.0),
                      obstacles: Sequence = (), plan: bool = True, low: Sequence = (),
@@ -665,53 +1003,93 @@ class SlamSession:
         [[bearing_rad, range_m]] free space with no wall at the end; cloud:
         [[x, y, height_m]] every reading (see the module docstring)."""
         odom = tuple(map(float, odom))
-        cfg = self.config
-        r = np.array([[float(b), float(d)] for b, d in rays if d is not None and d > 0], float).reshape(-1, 2)
-        pts = np.stack([sensor_xy[0] + r[:, 1] * np.cos(r[:, 0]),
-                        sensor_xy[1] + r[:, 1] * np.sin(r[:, 0])], 1) if len(r) else np.zeros((0, 2))
-        hit = r[:, 1] < cfg.max_range if len(r) else np.zeros(0, bool)
-
-        c = np.asarray(clear, float).reshape(-1, 2)
-        data = {"pts": pts, "sensor_xy": tuple(map(float, sensor_xy)),
-                "obstacles": np.asarray(obstacles, float).reshape(-1, 2),
-                "clear": np.stack([sensor_xy[0] + c[:, 1] * np.cos(c[:, 0]),
-                                   sensor_xy[1] + c[:, 1] * np.sin(c[:, 0])], 1) if len(c) else np.zeros((0, 2)),
-                "low": np.asarray(low, float).reshape(-1, 2), "drops": np.asarray(drops, float).reshape(-1, 2),
-                "cloud": np.asarray(cloud, np.float32).reshape(-1, 3)}
-
+        data, pts_hit = self._pack_scan(rays, sensor_xy, obstacles, low, drops, clear, cloud)
         with self.lock:
-            if self.keyframes:
-                last = self.keyframes[-1]
-                prior = compose(last.pose, between(last.odom, odom))
-            else:
-                # The first keyframe is taken where the run starts, so it IS initial_pose, whatever the
-                # odometry reads: odometry is not reset between tasks (Nov 21: explore after a follow
-                # started at odom (-9.2, -7.5), 11.9 m from the start, outside its 10 m radius: "done").
-                prior = tuple(self.initial_pose)
-            loop = self._close_loop(prior, pts[hit])
-            if loop:
-                m = MatchResult(tuple(loop.pop("pose")), loop["score"], True)
-            elif self.keyframes or self.grid.occupied().any():
-                field_ = _blur(self.grid.occupied(), sigma_cells=2.0)
-                m = match_scan(self.grid, field_, prior, pts[hit])
-            else:
-                m = MatchResult(prior, 0.0, False)
-            pose = m.pose if m.accepted else prior
+            return self._add_keyframe_locked(odom, data, pts_hit, plan=plan)
+
+    def _add_keyframe_locked(self, odom: tuple, data: dict, pts_hit: np.ndarray, plan: bool) -> dict:
+        k = len(self.keyframes)
+        if k:
+            last = self.keyframes[-1]
+            z_odom = between(last.odom, odom)
+            prior = compose(last.pose, z_odom)
+        else:
+            z_odom = None
+            prior = tuple(self.initial_pose)
+
+        loop = self._close_loop(prior, pts_hit)
+        if loop:
+            m = MatchResult(tuple(loop["pose"]), loop["score"], True)
+        elif k:
+            # Match against confirmed keyframes only (excluding unverified in-transit sub-scans
+            # attached to k-1, which were placed by raw odometry and would otherwise lock in drift).
+            ref_ids = range(max(0, k - 12), k)
+            ref_grid = self._submap(ref_ids, include_sub=False) if self._sub_scans.get(k - 1) else self.grid
+            field_ = _blur(ref_grid.clean_occupied(), sigma_cells=2.0)
+            m = match_scan(ref_grid, field_, prior, pts_hit)
+        elif self.grid.clean_occupied().any():
+            field_ = _blur(self.grid.clean_occupied(), sigma_cells=2.0)
+            m = match_scan(self.grid, field_, prior, pts_hit)
+        else:
+            m = MatchResult(prior, 0.0, False)
+
+        pose = m.pose if m.accepted else prior
+        kf = Keyframe(k, odom, pose, m.score, m.accepted)
+        self.keyframes.append(kf)
+        self._kf_data[kf.kf_id] = data
+
+        if k and z_odom is not None:
+            # Odometry edge (always added, moderate weight)
+            self._edges.append(PoseEdge(k - 1, k, z_odom, w_xy=16.0, w_th=40.0))
+            if m.accepted and not loop:
+                # Sequential scan-match edge (stronger than pure odometry)
+                self._edges.append(PoseEdge(k - 1, k, between(self.keyframes[k - 1].pose, pose),
+                                            w_xy=80.0, w_th=200.0))
+
+        if loop:
+            anchor = loop["with_kf"]
+            self._edges.append(PoseEdge(anchor, k, loop["z_loop"], w_xy=100.0, w_th=250.0, huber=0.35))
+            opt = optimize_pose_graph([n.pose for n in self.keyframes], self._edges)
+            for node, p_opt in zip(self.keyframes, opt):
+                node.pose = p_opt
+            pose = self.keyframes[-1].pose
+            self._rebuild()
+            loop = {kk: vv for kk, vv in loop.items() if kk not in ("pose", "z_loop")}
+        else:
             self._integrate(pose, data)
-            kf = Keyframe(len(self.keyframes), odom, pose, m.score, m.accepted)
-            self.keyframes.append(kf)
-            self._kf_data[kf.kf_id] = data
-            out = {
-                "kf_id": kf.kf_id,
-                "pose": [round(v, 4) for v in pose],
-                "map_to_odom": [round(v, 4) for v in self.map_to_odom()],
-                "match": {"score": m.score, "accepted": m.accepted,
-                          "prior": [round(v, 4) for v in prior]},
-                "loop": loop or {"closed": False},
-            }
-            if plan:
-                out.update(self._next_goal(pose))
-            return out
+
+        out = {
+            "kf_id": kf.kf_id,
+            "pose": [round(v, 4) for v in pose],
+            "map_to_odom": [round(v, 4) for v in self.map_to_odom()],
+            "match": {"score": m.score, "accepted": m.accepted,
+                      "prior": [round(v, 4) for v in prior]},
+            "loop": loop or {"closed": False},
+        }
+        if plan:
+            out.update(self._next_goal(pose))
+        return out
+
+    def _bfs_dist(self, trav: np.ndarray, start: tuple) -> np.ndarray:
+        """8-connected BFS shortest path distance (in cells) from `start` to every reachable cell."""
+        n_y, n_x = trav.shape
+        dist = np.full((n_y, n_x), np.inf, dtype=np.float32)
+        sx, sy = start
+        if not (0 <= sx < n_x and 0 <= sy < n_y):
+            return dist
+        dist[sy, sx] = 0.0
+        q = deque([(sx, sy)])
+        while q:
+            x, y = q.popleft()
+            d0 = float(dist[y, x])
+            for dx, dy in _N8:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < n_x and 0 <= ny < n_y and trav[ny, nx]:
+                    nd = d0 + (1.4142 if dx and dy else 1.0)
+                    if nd < dist[ny, nx]:
+                        dist[ny, nx] = nd
+                        q.append((nx, ny))
+        return dist
 
     def _next_goal(self, pose: Sequence[float]) -> dict:
         trav = self._trav()
@@ -722,34 +1100,72 @@ class SlamSession:
         if s is None or not fr:
             self.goal = None
             return {**base, "goal": None, "done": True}
-        # One BFS from the robot reaches every frontier; pick the nearest large
-        # one (size breaks ties so we don't chase slivers).
-        goal_mask = np.zeros_like(trav)
-        owner = {}
-        for i, (size, cells) in enumerate(fr):
-            ok = in_scope(self.initial_pose, *self.scope, self.grid.world(np.array(cells)))
-            for c, inside in zip(cells, ok):
-                if inside and trav[c[1], c[0]]:
-                    goal_mask[c[1], c[0]] = True
-                    owner[c] = i
-        if not goal_mask.any():
-            # Frontier cells are all inside the inflation (e.g. a gap narrower
-            # than the robot), or outside the radius / behind the start.
-            # Nothing reachable left.
+
+        now = time.monotonic()
+        self._unreachable = [u for u in self._unreachable if u[2] > now]
+        unreach_r = self.config.unreachable_radius_m
+
+        # Exact shortest-path distance from robot to all reachable cells
+        dist_cells = self._bfs_dist(trav, s)
+        unk = self.grid.unknown()
+        info_r = int(round(1.4 / self.grid.res))
+        n = self.grid.n
+        best = None  # (score, goal_xy, cluster_size, info_cells)
+
+        for size, cells in fr:
+            arr = np.array(cells, dtype=np.int64)
+            world_pts = self.grid.world(arr)
+            ok_scope = in_scope(self.initial_pose, *self.scope, world_pts)
+            reach = []
+            for (cx, cy), (wx, wy), inside in zip(cells, world_pts, ok_scope):
+                if not inside or not trav[cy, cx]:
+                    continue
+                d_c = float(dist_cells[cy, cx])
+                if not math.isfinite(d_c):
+                    continue
+                if any(math.hypot(wx - ux, wy - uy) < unreach_r for ux, uy, _ in self._unreachable):
+                    continue
+                reach.append((d_c, cx, cy, float(wx), float(wy)))
+            if not reach:
+                continue
+            # Pick the cluster's reachable cell nearest its centroid (more open than an extreme edge),
+            # falling back to the nearest reachable cell in the cluster.
+            med_x = float(np.median([r[3] for r in reach]))
+            med_y = float(np.median([r[4] for r in reach]))
+            rep = min(reach, key=lambda r: math.hypot(r[3] - med_x, r[4] - med_y))
+            d_m = rep[0] * self.grid.res
+            cx, cy, wx, wy = rep[1], rep[2], rep[3], rep[4]
+
+            # Expected information gain: unknown cells within sensor reach of this frontier
+            y0, y1 = max(0, cy - info_r), min(n, cy + info_r + 1)
+            x0, x1 = max(0, cx - info_r), min(n, cx + info_r + 1)
+            info = float(unk[y0:y1, x0:x1].sum())
+            gain = math.sqrt(max(1.0, info)) + 0.5 * math.sqrt(size)
+
+            # Turn penalty + room-continuity hysteresis (finish current area before crossing house)
+            bearing = math.atan2(wy - pose[1], wx - pose[0])
+            turn_pen = 0.35 * abs(wrap(bearing - pose[2])) if len(pose) >= 3 else 0.0
+            cost = d_m + turn_pen + 0.5
+            if self._prev_goal_xy is not None and math.hypot(wx - self._prev_goal_xy[0], wy - self._prev_goal_xy[1]) < 1.5:
+                cost *= 0.72
+            score = gain / cost
+            if best is None or score > best[0]:
+                best = (score, (wx, wy), size, int(info))
+
+        if best is None:
             self.goal = None
             return {**base, "goal": None, "done": True}
-        end, parent = _bfs(trav, s, goal_mask=goal_mask)
-        if end is None:
+
+        _, goal_xy, f_size, info_cells = best
+        path = self._plan(pose[:2], goal_xy)
+        if path is None:
             self.goal = None
             return {**base, "goal": None, "done": True}
-        cells = _shortcut(trav, _unwind(parent, end))
-        path = [tuple(round(float(v), 3) for v in self.grid.world(np.array(c))) for c in cells]
-        roomy = plan_path(self.grid, self._trav(self.config.pref_clearance), pose, path[-1]) \
-            if self.config.pref_clearance > 0 else None
-        if roomy is not None:                       # the same goal, with room to spare
-            path = [(round(a, 3), round(b, 3)) for a, b in roomy]
+        path = [(round(a, 3), round(b, 3)) for a, b in path]
+        self._prev_goal_xy = path[-1]
         self.goal = {"xy": list(path[-1]), "path": [list(p) for p in path],
-                     "clear_m": self._clearances(path), "frontier_cells": fr[owner[end]][0]}
+                     "clear_m": self._clearances(path), "frontier_cells": f_size,
+                     "info_cells": info_cells}
         return {**base, "goal": self.goal, "done": False}
 
     def walls(self, min_len: float = 0.5) -> dict:

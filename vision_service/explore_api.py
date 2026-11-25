@@ -277,6 +277,12 @@ class ResetIn(BaseModel):
     no_behind: bool = Field(False, description="only explore ahead of initial_pose's heading")
 
 
+class UnreachableIn(BaseModel):
+    xy: list[float] = Field(min_length=2, max_length=2, description="map [x, y] the robot could not reach")
+    pose: Optional[list[float]] = Field(None, min_length=2, max_length=3, description="current map pose")
+    ttl_s: Optional[float] = Field(None, gt=0.0, le=600.0)
+
+
 @router.post("/v1/slam/keyframe", tags=["slam"])
 async def slam_keyframe(request: Request, body: KeyframeIn, background: BackgroundTasks) -> dict:
     s = request.app.state.slam
@@ -291,6 +297,27 @@ async def slam_keyframe(request: Request, body: KeyframeIn, background: Backgrou
     # crash or a dead battery mid-run loses at most the scan in flight.
     background.add_task(_save_map, request.app.state)
     return out
+
+
+@router.post("/v1/slam/scan", tags=["slam"])
+async def slam_scan(request: Request, body: KeyframeIn) -> dict:
+    """Fold a continuous in-transit ToF scan into the live map without creating a full anchor
+    keyframe. Attached to the latest anchor so future loop closures re-align it too."""
+    s = request.app.state.slam
+    for r in body.rays:
+        if len(r) != 2 or r[0] is None:
+            raise HTTPException(status_code=422, detail="each ray is [bearing_rad, range_m|null]")
+    if any(len(p) != 2 for p in body.low + body.drops + body.clear) or any(len(p) != 3 for p in body.cloud):
+        raise HTTPException(status_code=422, detail="low, drops, clear are pairs; cloud is [x, y, height]")
+    return await run_in_threadpool(s.add_scan, body.odom, body.rays, body.sensor_xy,
+                                   body.obstacles, body.low, body.drops, body.clear, body.cloud, body.plan)
+
+
+@router.post("/v1/slam/unreachable", tags=["slam"])
+async def slam_unreachable(request: Request, body: UnreachableIn) -> dict:
+    """Temporarily blacklist a frontier region that LocalNav could not reach and return the next goal."""
+    s = request.app.state.slam
+    return await run_in_threadpool(s.mark_unreachable, body.xy, body.ttl_s, body.pose)
 
 
 def _save_map(st) -> str:
