@@ -150,36 +150,55 @@ class OccupancyGrid:
                   wedge_rad: float = 0.0) -> None:
         """origin_xy: (n,2) sensor positions; hits_xy: (n,2) ray endpoints (world).
         Rays shorter than max_range end in an obstacle. When wedge_rad > 0 (e.g.
-        8x8 ToF columns), free space is carved across the full angular wedge with
-        sub-cell angular density so zero inter-ray slivers survive at any range."""
+        8x8 ToF columns), free space is also carved between adjacent bearings up to
+        min(r_i, r_{i+1}) - 1.5*res so zero radial slivers survive while never
+        poking through slanted walls or doorway corners."""
         if not len(hits_xy):
             return
         free = []
         occ = []
         step = self.res / 2.0
-        for o, h in zip(origin_xy, hits_xy):
-            d = h - o
-            length = float(np.hypot(*d))
+        vecs = hits_xy - origin_xy
+        lens = np.hypot(vecs[:, 0], vecs[:, 1])
+        angs = np.arctan2(vecs[:, 1], vecs[:, 0])
+        for o, h, d, length in zip(origin_xy, hits_xy, vecs, lens):
             if length < 1e-6:
                 continue
-            carve_len = min(length, max_range) if max_range > 0 else length
-            base_ang = math.atan2(d[1], d[0])
-            if wedge_rad > 1e-4:
-                n_sub = max(3, int(math.ceil(carve_len * wedge_rad / (self.res * 0.85))) + 1)
-                angs = base_ang + np.linspace(-0.5 * wedge_rad, 0.5 * wedge_rad, n_sub)
-                stop_len = max(0.0, carve_len - (1.4 * self.res if max_range > 0 else 0.0))
-                if stop_len > 1e-6:
-                    ts = np.arange(0.0, stop_len, step)
-                    dirs = np.stack([np.cos(angs), np.sin(angs)], axis=1)        # (n_sub, 2)
-                    pts = o[None, None, :] + ts[:, None, None] * dirs[None, :, :]  # (nt, n_sub, 2)
-                    free.append(self.cells(pts.reshape(-1, 2)))
-            else:
-                stop_len = max(0.0, carve_len - (self.res if max_range > 0 else 0.0))
-                if stop_len > 1e-6:
-                    ts = np.arange(0.0, stop_len, step)
-                    free.append(self.cells(o + np.outer(ts / length, d)))
+            carve_len = min(float(length), max_range) if max_range > 0 else float(length)
+            stop_len = max(0.0, carve_len - (self.res if max_range > 0 else 0.0))
+            if stop_len > 1e-6:
+                ts = np.arange(0.0, stop_len, step)
+                free.append(self.cells(o + np.outer(ts / length, d)))
             if max_range > 0 and length < max_range - 1e-6:
                 occ.append(self.cells(h[None, :]))
+        # Safe angular wedge fill between adjacent bearings (uses min(r_i, r_{i+1}) so
+        # side sub-rays NEVER overshoot a slanted wall or doorway corner).
+        if wedge_rad > 1e-4 and len(hits_xy) >= 2:
+            valid = lens > 1e-6
+            if valid.sum() >= 2:
+                o0 = origin_xy[valid][0]
+                v_lens = np.minimum(lens[valid], max_range) if max_range > 0 else lens[valid]
+                v_angs = angs[valid]
+                order = np.argsort(v_angs)
+                v_lens, v_angs = v_lens[order], v_angs[order]
+                max_da = max(wedge_rad * 1.45, math.radians(9.5))
+                m_pts = len(v_angs)
+                for idx in range(m_pts):
+                    nxt = (idx + 1) % m_pts
+                    da = wrap(float(v_angs[nxt] - v_angs[idx]))
+                    if da <= 1e-4 or da > max_da:
+                        continue
+                    safe_r = min(float(v_lens[idx]), float(v_lens[nxt])) - (1.5 * self.res if max_range > 0 else 0.0)
+                    if safe_r <= self.res:
+                        continue
+                    n_sub = max(2, int(math.ceil(safe_r * da / (self.res * 0.85))) + 1)
+                    sub_angs = float(v_angs[idx]) + np.linspace(0.0, da, n_sub)[1:-1]
+                    if not len(sub_angs):
+                        continue
+                    ts = np.arange(0.0, safe_r, step)
+                    dirs = np.stack([np.cos(sub_angs), np.sin(sub_angs)], axis=1)
+                    pts = o0[None, None, :] + ts[:, None, None] * dirs[None, :, :]
+                    free.append(self.cells(pts.reshape(-1, 2)))
         if free:
             fc = np.concatenate(free)
             if occ:
@@ -189,7 +208,34 @@ class OccupancyGrid:
                 fc = fc[~np.isin(key(fc), key(oc))]
             self._bump(fc, L_FREE)
         if occ:
-            self._bump(np.concatenate(occ), L_OCC)
+            oc_arr = np.concatenate(occ)
+            if wedge_rad > 1e-4 and len(hits_xy) >= 2:
+                valid = (lens > 1e-6) & (lens < max_range - 1e-6)
+                if valid.sum() >= 2:
+                    v_pts = hits_xy[valid]
+                    v_lens = lens[valid]
+                    v_angs = angs[valid]
+                    order = np.argsort(v_angs)
+                    v_pts, v_lens, v_angs = v_pts[order], v_lens[order], v_angs[order]
+                    max_da = max(wedge_rad * 1.45, math.radians(9.5))
+                    seg_cells = [oc_arr]
+                    m_pts = len(v_pts)
+                    for idx in range(m_pts):
+                        nxt = (idx + 1) % m_pts
+                        da = abs(wrap(float(v_angs[nxt] - v_angs[idx])))
+                        if da > max_da:
+                            continue
+                        if abs(float(v_lens[nxt] - v_lens[idx])) > 0.28:
+                            continue
+                        p0, p1 = v_pts[idx], v_pts[nxt]
+                        seg_d = float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
+                        if seg_d > 0.50 or seg_d < self.res:
+                            continue
+                        n_st = max(2, int(math.ceil(seg_d / (self.res * 0.5))) + 1)
+                        ts = np.linspace(0.0, 1.0, n_st)
+                        seg_cells.append(self.cells(p0[None, :] + np.outer(ts, p1 - p0)))
+                    oc_arr = np.concatenate(seg_cells)
+            self._bump(oc_arr, L_OCC)
 
     def mark_free_disc(self, xy: Sequence[float], radius: float) -> None:
         """The robot is standing here, so it is certainly traversable."""
@@ -220,6 +266,16 @@ def _despeckle(mask: np.ndarray) -> np.ndarray:
 
 
 def _blur(mask: np.ndarray, sigma_cells: float) -> np.ndarray:
+    """Uniform Gaussian likelihood field exp(-d^2 / (2*sigma^2)) from occupied cells.
+    Unlike separable convolution divided by out.max() (which halved straight-wall peaks
+    relative to corners), every wall cell has exact peak 1.0 regardless of wall thickness."""
+    if not mask.any():
+        return np.zeros(mask.shape, dtype=np.float32)
+    if _distance_field is not None:
+        # _distance_field expects [ix, iy] or any 2D bool array (isotropic Euclidean distance)
+        cap = max(6.0, 4.0 * sigma_cells)
+        d = _distance_field(mask, 1.0, cap_m=cap)
+        return np.exp(-0.5 * (d / max(sigma_cells, 0.5)) ** 2).astype(np.float32)
     r = max(1, int(3 * sigma_cells))
     k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma_cells) ** 2).astype(np.float32)
     out = mask.astype(np.float32)
@@ -574,8 +630,10 @@ def plan_path(grid: OccupancyGrid, trav: np.ndarray, start_xy, goal_xy) -> Optio
 
 
 def frontiers(grid: OccupancyGrid, min_cells: int = 6) -> list:
-    """Clusters of free cells that touch unknown space: list of (n_cells, [ix, iy] cells)."""
-    free, unk = grid.free(), grid.unknown()
+    """Clusters of free cells that touch open unknown space (ignoring 2-cell unknown shadows
+    pressed right up against mapped walls/furniture): list of (n_cells, [ix, iy] cells)."""
+    free = grid.free()
+    unk = grid.unknown() & ~_dilate(grid.clean_occupied(), 2)
     touch = np.zeros_like(free)
     touch[1:, :] |= unk[:-1, :]
     touch[:-1, :] |= unk[1:, :]
@@ -842,17 +900,20 @@ class SlamSession:
     def _submap(self, ids, include_sub: bool = True) -> OccupancyGrid:
         """Walls only, from these keyframes (and optionally their attached continuous sub-scans)."""
         g = OccupancyGrid(self.config.size_m, self.config.res)
+        w = self.config.wedge_rad
         for i in ids:
             kf, d = self.keyframes[i], self._kf_data.get(i)
             if d is not None and len(d["pts"]):
                 origin = transform(kf.pose, np.array([d["sensor_xy"]], float))
-                g.integrate(np.repeat(origin, len(d["pts"]), 0), transform(kf.pose, d["pts"]), self.config.max_range)
+                g.integrate(np.repeat(origin, len(d["pts"]), 0), transform(kf.pose, d["pts"]),
+                            self.config.max_range, wedge_rad=w)
             if include_sub:
                 for rel, sd in self._sub_scans.get(i, ()):
                     if len(sd["pts"]):
                         sp = compose(kf.pose, rel)
                         origin = transform(sp, np.array([sd["sensor_xy"]], float))
-                        g.integrate(np.repeat(origin, len(sd["pts"]), 0), transform(sp, sd["pts"]), self.config.max_range)
+                        g.integrate(np.repeat(origin, len(sd["pts"]), 0), transform(sp, sd["pts"]),
+                                    self.config.max_range, wedge_rad=w)
         return g
 
     def _rebuild(self) -> None:
@@ -1039,16 +1100,17 @@ class SlamSession:
         self._kf_data[kf.kf_id] = data
 
         if k and z_odom is not None:
-            # Odometry edge (always added, moderate weight)
-            self._edges.append(PoseEdge(k - 1, k, z_odom, w_xy=16.0, w_th=40.0))
             if m.accepted and not loop:
-                # Sequential scan-match edge (stronger than pure odometry)
+                # Sequential scan-match constraint (replaces raw drifting odometry on this step)
                 self._edges.append(PoseEdge(k - 1, k, between(self.keyframes[k - 1].pose, pose),
-                                            w_xy=80.0, w_th=200.0))
+                                            w_xy=40.0, w_th=120.0))
+            else:
+                # Odometry-only fallback (looser so future loop closures can relax drift smoothly)
+                self._edges.append(PoseEdge(k - 1, k, z_odom, w_xy=8.0, w_th=20.0))
 
         if loop:
             anchor = loop["with_kf"]
-            self._edges.append(PoseEdge(anchor, k, loop["z_loop"], w_xy=100.0, w_th=250.0, huber=0.35))
+            self._edges.append(PoseEdge(anchor, k, loop["z_loop"], w_xy=200.0, w_th=500.0, huber=4.0))
             opt = optimize_pose_graph([n.pose for n in self.keyframes], self._edges)
             for node, p_opt in zip(self.keyframes, opt):
                 node.pose = p_opt
@@ -1124,6 +1186,8 @@ class SlamSession:
                 if not math.isfinite(d_c):
                     continue
                 if any(math.hypot(wx - ux, wy - uy) < unreach_r for ux, uy, _ in self._unreachable):
+                    continue
+                if any(math.hypot(wx - kf.pose[0], wy - kf.pose[1]) < 0.40 for kf in self.keyframes):
                     continue
                 reach.append((d_c, cx, cy, float(wx), float(wy)))
             if not reach:
