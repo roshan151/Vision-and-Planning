@@ -154,7 +154,7 @@ class PlanIn(BaseModel):
     pose: list                   # (x, y, heading) in the Pi's odometry frame
     goal: list                   # (x, y) in the same frame
     target: Optional[list] = None  # (x, y): what the goal is for (the person): the goal stays on its side of walls
-    radius_m: float = 0.19
+    radius_m: float = 0.23       # aligned with Pi DWA body_radius_m (0.165) + margin (0.04) + PLAN_EXTRA_M (0.025)
     local: Optional[dict] = None  # RollingCostmap.snapshot()
 
 

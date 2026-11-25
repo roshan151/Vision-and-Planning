@@ -355,7 +355,11 @@ class FollowSession:
             if self.sweep and now - self.sweep_t < SWEEP_DWELL_S:
                 return self._out("searching", geo)
             self.sweep_t, self.view_t = now, None
-            self.sweep = self.sweep % len(self.path) + 1  # next head position
+            if self.sweep >= len(self.path):
+                # Full gimbal pan sweep missed: turn the body 180 deg to search the back hemisphere.
+                self.sweep = 0
+                return self._out("searching", geo, turn_deg=180.0)
+            self.sweep += 1                               # next head position
             return self._out("searching", geo)
 
         if not self.locked:          # still confirming who it is: don't move yet

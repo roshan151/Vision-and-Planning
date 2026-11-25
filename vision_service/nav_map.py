@@ -82,6 +82,18 @@ def _los(free: np.ndarray, a, b) -> bool:
     return bool(free[xs, ys].all())
 
 
+def _los_penalty(free: np.ndarray, penalty: Optional[np.ndarray], a, b) -> Optional[float]:
+    """None if a -> b hits an obstacle; otherwise the integrated soft clearance cost along the segment."""
+    n = int(max(abs(b[0] - a[0]), abs(b[1] - a[1])) * 2) + 1
+    xs = np.rint(np.linspace(a[0], b[0], n)).astype(int)
+    ys = np.rint(np.linspace(a[1], b[1], n)).astype(int)
+    if not bool(free[xs, ys].all()):
+        return None
+    if penalty is None:
+        return 0.0
+    return float(penalty[xs, ys].mean()) * math.dist(a, b) * 0.10
+
+
 def theta_star(free: np.ndarray, start, goal, penalty: Optional[np.ndarray] = None,
                max_expand: int = 200_000) -> Optional[list]:
     """Any-angle A* on a bool grid [ix, iy]: cells [start, ..., goal] or None."""
@@ -105,12 +117,13 @@ def theta_star(free: np.ndarray, start, goal, penalty: Optional[np.ndarray] = No
             n = (c[0] + dx, c[1] + dy)
             if not (0 <= n[0] < nx and 0 <= n[1] < ny) or not free[n] or n in closed:
                 continue
-            extra = 0.0 if penalty is None else float(penalty[n])
+            extra = 0.0 if penalty is None else float(penalty[n]) * 0.10
             p = parent[c]
-            if p != c and _los(free, p, n):
-                cost, via = g[p] + math.dist(p, n) + extra, p
+            seg_pen = _los_penalty(free, penalty, p, n) if p != c else None
+            if seg_pen is not None:
+                cost, via = g[p] + math.dist(p, n) + seg_pen, p
             else:
-                cost, via = g[c] + math.dist(c, n) + extra, c
+                cost, via = g[c] + math.dist(c, n) * (1.0 + extra), c
             if cost < g.get(n, math.inf):
                 g[n], parent[n] = cost, via
                 heapq.heappush(todo, (cost + math.dist(n, goal), n))
@@ -305,9 +318,9 @@ class GlobalMap:
             far = np.hypot(xs - b[0], ys - b[1]) > rb
             return not bool(occ[xs[far], ys[far]].any())
         penalty = np.clip((radius_m + 0.4 - field) / 0.4, 0.0, 1.0) * 2.0 + unknown * 0.3
-        # The roomy margin first; if that path is the long way round, narrower ones too (down to 0: the Pi's
-        # radius_m already holds DWA's radius + margin + PLAN_EXTRA_M), and the shorter way wins by DETOUR_M.
-        # Nov 23: a 0.5-0.6 m gap DWA could drive (it needs 0.43 m) was planned 5-9 m round, or not at all.
+        # The roomy margin first (+1.5 cm corner-swing room for the square chassis when pivoting); if that
+        # path is the long way round, narrower ones too (down to 0: the Pi's radius_m already holds DWA's
+        # body_radius_m + margin + PLAN_EXTRA_M), and the shorter way wins by DETOUR_M.
         best = None
         for margin in (margin_m, 0.03, 0.0):
             free = field >= radius_m + margin

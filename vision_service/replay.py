@@ -76,26 +76,39 @@ def load(session: str, clean: bool = True) -> list:
     out = []
     for fn in sorted(glob.glob(os.path.join(session, "[0-9]*.json"))):
         d = json.load(open(fn))
-        ex, f = d.get("extras") or {}, d.get("frame") or {}
+        ex, f, geom = d.get("extras") or {}, d.get("frame") or {}, d.get("geometry") or {}
+        on_gimbal = bool(geom.get("imu_on_gimbal"))
+        tilt_off = float(geom.get("head_tilt_offset_deg") or TILT_OFFSET_DEG)
+        raw_pitch = ex.get("pitch_deg")
         if "tof_seq" in d:
             for g in d["tof_seq"]:
                 if g.get("pose") is not None:
+                    still = g.get("head_still")
+                    if on_gimbal:
+                        gtilt = (raw_pitch + tilt_off) if (still is not False and raw_pitch is not None) else g["tilt_deg"]
+                        gpitch = 0.0
+                    else:
+                        gtilt, gpitch = g["tilt_deg"], raw_pitch or 0.0
                     out.append(dict(t=g["t"], pose=np.array(g["pose"], float), pan=g["pan_deg"],
-                                    tilt=g["tilt_deg"], pitch=ex.get("pitch_deg") or 0.0, rows=g["rows"],
+                                    tilt=gtilt, pitch=gpitch, rows=g["rows"],
                                     age_ms=0, image=None, timed=True))
             if f.get("pose") is not None and d.get("image"):
                 out.append(dict(t=f["t"], pose=np.array(f["pose"], float), pan=f["pan_deg"], tilt=f["tilt_deg"],
-                                pitch=ex.get("pitch_deg") or 0.0, rows=None, age_ms=0, timed=True,
+                                pitch=0.0 if on_gimbal else (raw_pitch or 0.0), rows=None, age_ms=0, timed=True,
                                 image=os.path.join(session, d["image"])))
             continue
         rows = (d.get("tof") or {}).get("rows")
         if not ex.get("pose") or not rows or f.get("pan_deg") is None:
             continue
         pan, tilt = f["pan_deg"], f["tilt_deg"]
-        if "head_tilt_offset_deg" not in (d.get("geometry") or {}):
+        if "head_tilt_offset_deg" not in geom:
             tilt += TILT_OFFSET_DEG            # recorded before tilts were stored as real
+        if on_gimbal and raw_pitch is not None and f.get("settled") is not False:
+            tilt, pitch = raw_pitch + tilt_off, 0.0
+        else:
+            pitch = 0.0 if on_gimbal else (raw_pitch or 0.0)
         out.append(dict(t=datetime.fromisoformat(d["ts"]).timestamp(), pose=np.array(ex["pose"], float),
-                        pan=pan, tilt=tilt, pitch=ex.get("pitch_deg") or 0.0, rows=rows,
+                        pan=pan, tilt=tilt, pitch=pitch, rows=rows,
                         age_ms=d["tof"].get("age_ms") or 0,
                         image=os.path.join(session, d["image"]) if d.get("image") else None))
     out.sort(key=lambda f: f["t"])
